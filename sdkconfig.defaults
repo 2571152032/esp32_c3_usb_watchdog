@@ -1,0 +1,53 @@
+# 默认 sdkconfig (ESP-IDF v6.1)  ——  配套 4MB Flash + partitions.csv
+# 用法: cp sdkconfig.defaults sdkconfig, 然后 idf.py build
+#
+# ⚠ 分区表与 Flash 大小必须配套, 否则报
+#   "Partitions tables occupies X MB ... does not fit in configured flash size Y MB"
+#   根 CMakeLists.txt 有自动校验, 会在编译前拦截并给出提示。
+#
+# 若你的模块确实是 2MB:
+#   1. cp partitions_2mb.csv partitions.csv
+#   2. 把下面改成 CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+#   3. idf.py fullclean && idf.py build
+
+# ===== Flash 大小 (必须与 partitions.csv 匹配!) =====
+# 4MB: 每 OTA 槽 1984 KB。实测固件 932KB, 填充率约 47%, 余量充足。
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# ===== Flash 分区 =====
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# ===== OTA (A/B) =====
+# 普通回滚: 新固件启动后若未标记为 valid (或反复崩溃), bootloader 自动切回上一分区
+# 这是安全的兜底, 保留开启
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# anti-rollback (防降级): 关闭
+# 原因: 它要求新固件的 secure_version 严格递增, 否则永久拒绝启动 (只能串口救砖)。
+#       对本项目这种 Web 手动上传固件的场景风险大于收益, 故关闭。
+#       若确实需要防降级, 改为 =y 并保证每次发布递增 CONFIG_BOOTLOADER_APP_SECURE_VERSION
+# CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK is not set
+
+CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY=0
+
+# ===== USB CDC (USB Serial JTAG) =====
+CONFIG_USB_CDC_ENABLED=y
+CONFIG_ESP_CONSOLE_USB_CDC=y
+
+# ===== 硬件看门狗兜底 =====
+# ⚠ 这两项必须保持开启! 代码不再自行 esp_task_wdt_init(), 完全依赖
+#    IDF 在这里的自动初始化。若把 CONFIG_ESP_TASK_WDT 关掉,
+#    esp_task_wdt_add() 会失败, 兜底看门狗就没了 (代码会静默降级, 不报错)。
+CONFIG_ESP_TASK_WDT=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# ===== WiFi =====
+CONFIG_ESP_WIFI_SSID=""
+CONFIG_ESP_WIFI_PASSWORD=""
+CONFIG_ESP_WIFI_SCAN_RSSI_THRESHOLD=-127
+
+# ===== 堆 & 栈 =====
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=3072
