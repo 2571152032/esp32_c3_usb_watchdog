@@ -13,30 +13,41 @@ Linux 服务器硬件看门狗：USB CDC-ACM 心跳 + GPIO 硬件控制 + Web �
 
 ## 目录结构
 
-├── CMakeLists.txt         # 项目注册
-├── partitions.csv         # OTA 双分区表（4MB Flash 版，默认）
-├── sdkconfig.defaults     # 默认配置（4MB分区表）
-├── main/
-│   ├── CMakeLists.txt     # 组件注册（含 ota_update / dashboard_html / event_log / uptime）
-│   ├── main.c
-│   ├── usb_device.c/.h    # USB CDC-ACM 心跳收发
-│   ├── watchdog.c/.h      # 看门狗逻辑（60s / 600s）
-│   ├── web_server.c/.h    # Web 控制台 + 认证 + OTA 路由
-│   ├── dashboard_html.c/.h# 控制台 UI 模板
-│   ├── ota_update.c/.h    # 固件 OTA 上传 / 校验 / 写入 / 回滚
-│   ├── smart_config.c/.h  # AP 配网
-│   ├── wizard_html.c      # 配网向导页面
-│   ├── gpio_control.c/.h  # GPIO 控制
-│   ├── nvs_storage.c/.h   # NVS（WiFi + 凭据 + 心跳参数）
-│   ├── event_log.c/.h     # 事件日志（RAM + NVS）
-│   └── uptime.c/.h        # 运行时间 / 重启计数
-└── sdkconfig.defaults     # 默认配置
+```text
+esp32_c3_usb_watchdog/
+├── CMakeLists.txt           # 项目注册 (PROJECT_VER = 1.2.31)
+├── partitions.csv           # OTA 双分区表 (4MB Flash 版, 默认)
+├── sdkconfig.defaults       # 默认配置
+├── README.md
+├── demo/
+│   └── dashboard_demo.html  # 纯前端演示页 (浏览器直接打开, 无需设备)
+└── main/
+    ├── CMakeLists.txt       # 组件注册
+    ├── main.c               # 入口 / system_task 状态机
+    ├── usb_device.c/.h      # USB CDC-ACM 心跳收发
+    ├── watchdog.c/.h        # 看门狗逻辑 (60s / 600s)
+    ├── web_server.c/.h      # Web 控制台 + 认证 + OTA 路由
+    ├── dashboard_html.c/.h  # 控制台 UI 模板
+    ├── ota_update.c/.h      # 固件 OTA 上传 / 校验 / 写入 / 回滚
+    ├── smart_config.c/.h    # AP 配网
+    ├── wizard_html.c/.h     # 配网向导页面
+    ├── gpio_control.c/.h    # GPIO 控制
+    ├── nvs_storage.c/.h     # NVS (WiFi + 凭据 + 心跳参数)
+    ├── event_log.c/.h       # 事件日志 (RAM + NVS)
+    └── uptime.c/.h          # 运行时间 / 重启计数
+```
 
 ## 构建（ESP-IDF v6.1）
 
+```bash
 idf.py set-target esp32c3
 idf.py build
 idf.py flash monitor
+```
+
+**版本号**：根 `CMakeLists.txt` 中的 `set(PROJECT_VER "1.2.31")` 控制。发版时改这一处即可，
+版本号与构建日期会自动写入镜像 `esp_app_desc_t`，Web 控制台页头显示
+`固件版本 · v1.2.31 · 构建日期 Sep 16 2026`，OTA 上传页解析的也是同一字段。
 
 > 改过 `sdkconfig.defaults` 或 `partitions.csv` 后，建议 `idf.py fullclean` 再 `build`，
 > 否则 CMake 可能沿用旧缓存导致新配置不生效。
@@ -81,9 +92,9 @@ idf.py flash monitor
 
 ### 界面概览
 
-- **服务器状态**：脉冲呼吸 LED（绿=正常 / 橙=警告 / 红=宕机 / 灰=USB 断开），实时显示 USB 连接、心跳间隔、固件版本与运行分区
+- **服务器状态**：脉冲呼吸 LED（绿=正常 / 橙=警告 / 红=宕机 / 灰=USB 断开），实时显示 USB 连接、心跳间隔、固件版本与构建日期（页头）、真实运行时长（右上角）
 - **心跳统计**：心跳数 / 响应数 / 超时数 / 服务器已重启次数
-- **固件更新 (OTA)**：拖拽或点击选择 `.bin`，显示文件名、大小、镜像版本，带进度条与状态标签，刷写成功后自动重启
+- **固件更新 (OTA)**：拖拽或点击选择 `.bin`，显示文件名、大小、**固件版本**（按 `esp_app_desc` 结构精确解析上传镜像的版本号），带进度条与状态标签，刷写成功后自动重启
 - **看门狗参数**：心跳间隔、超时时间（下限 60s）
 - **登录凭据**：修改用户名 / 密码（需验证当前密码）
 - **服务器电源控制**：开机 / 强制关机 / 重启 / 重置网络
@@ -120,7 +131,7 @@ idf.py flash monitor
 **注意事项**
 
 - 升级期间**务必保持供电稳定**，断电可能导致需重新烧录
-- 固件大小上限：**2MB  配置为 1984 KB**
+- 固件大小上限：**1984 KB / OTA 槽**（4MB 分区方案，当前实际占用约 47%）
 - 上传的必须是**纯 app 镜像**（`build/xxx.bin`），**不能**是 `merged.bin`（含 bootloader 的合并镜像）
 - 若设备无法启动（罕见），需通过串口重新烧录
 
@@ -153,7 +164,7 @@ error: unknown conversion type character ',' in format [-Werror=format]
 模板中的占位符（`main/dashboard_html.c`）：
 
 ```
-{{VERSION}} {{LED_CLASS}} {{STATE_TEXT}} {{USB_STATE}}
+{{VERSION}} {{BUILD_DATE}} {{LED_CLASS}} {{STATE_TEXT}} {{USB_STATE}}
 {{INTERVAL}} {{TIMEOUT}} {{PARTITION}}
 {{HB_COUNT}} {{RESP_COUNT}} {{TIMEOUT_COUNT}} {{REBOOT_COUNT}}
 ```
@@ -303,7 +314,7 @@ dashboard 页面另需约 20KB 渲染模板。两者并发时峰值约 45KB —�
 - 12 个源文件通过 ESP-IDF v6.1 语法检查
 - 模板文件用真实 `gcc -Werror=format` 编译通过（确认 CSS 中的 `%` 安全）
 - 全项目 `printf` 格式串经脚本扫描：`%` 均为合法转换符，无 `-Wformat` 风险
-- 占位符与后端替换表一一对应（模板 14 处、11 个唯一 key，重复项全部覆盖）
+- 占位符与后端替换表一一对应（模板 15 处、12 个唯一 key，重复项全部覆盖）
 - 分区表经校验：4MB 默认配置占用 4096 KB / Flash 4MB ✓，2MB 备选亦验证通过
 - 根 `CMakeLists.txt` 内置分区表 vs Flash 大小一致性校验（configure 阶段拦截）
 - HTML 标签平衡、JavaScript 通过 `node --check`、无未声明变量
