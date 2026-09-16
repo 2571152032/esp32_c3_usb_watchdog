@@ -97,7 +97,7 @@ static void watchdog_reset_state_internal(void)
     s_wd.last_response_ms = (uint32_t)(esp_timer_get_time() / 1000);
     if (s_wd.state == WD_STATE_SERVER_DOWN) {
         s_wd.state = WD_STATE_HEALTHY;
-        LOG_I("Server connection restored");
+        LOG_I("服务器连接已恢复");
     }
 }
 
@@ -109,7 +109,7 @@ static void usb_packet_handler(const usb_packet_t *packet)
         watchdog_notify_response();
     } else if (packet->cmd == USB_CMD_BYE) {
         ESP_LOGW(TAG, "Server sent BYE");
-        LOG_W("Server sent BYE");
+        LOG_W("服务器发送了 BYE 信号");
         s_wd.state = WD_STATE_SERVER_DOWN;
     }
 }
@@ -118,7 +118,7 @@ static void watchdog_task(void *pvParameter)
 {
     ESP_LOGI(TAG, "Watchdog task started (interval=%lus, timeout=%lus)",
              s_wd.heartbeat_interval_s, s_wd.heartbeat_timeout_s);
-    LOG_I("Watchdog started: interval=%lus, timeout=%lus",
+    LOG_I("看门狗已启动: 心跳间隔 %lu 秒, 超时 %lu 秒",
           (unsigned long)s_wd.heartbeat_interval_s, (unsigned long)s_wd.heartbeat_timeout_s);
 
     vTaskDelay(pdMS_TO_TICKS(5000));
@@ -145,7 +145,7 @@ static void watchdog_task(void *pvParameter)
             s_wd.consecutive_timeouts = 0;
         } else if (s_wd.boot_grace_until_ms > 0 && now_ms >= s_wd.boot_grace_until_ms) {
             // 宽限期刚结束
-            LOG_I("Boot grace period ended, normal monitoring resumed");
+            LOG_I("开机宽限期已结束, 恢复正常监控");
             s_wd.boot_grace_until_ms = 0;
         }
 
@@ -169,13 +169,13 @@ static void watchdog_task(void *pvParameter)
                 ESP_LOGW(TAG, "Heartbeat timeout #%lu (elapsed=%lus, limit=%lus)",
                          (unsigned long)s_wd.consecutive_timeouts,
                          (unsigned long)elapsed_s, (unsigned long)s_wd.heartbeat_timeout_s);
-                LOG_W("Heartbeat timeout #%lu (elapsed=%lus)",
+                LOG_W("心跳超时 #%lu (已等待 %lu 秒)",
                       (unsigned long)s_wd.consecutive_timeouts, (unsigned long)elapsed_s);
 
                 if (s_wd.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
                     s_wd.state = WD_STATE_SERVER_DOWN;
                     ESP_LOGE(TAG, "SERVER DOWN DETECTED!");
-                    LOG_E("SERVER DOWN -> GPIO reset (pulse 500ms)");
+                    LOG_E("检测到服务器宕机 -> GPIO 复位 (脉冲 500 毫秒)");
 
                     trend_push(TREND_DOWN);
                     uptime_inc_reboots();
@@ -191,7 +191,7 @@ static void watchdog_task(void *pvParameter)
                     if (s_wd.reboot_count_in_hour > CONFIG_WD_MAX_REBOOTS_PER_HOUR) {
                         ESP_LOGE(TAG, "MAX REBOOTS (%d/hour) REACHED - stopping watchdog",
                                  CONFIG_WD_MAX_REBOOTS_PER_HOUR);
-                        LOG_F("Watchdog STOPPED: max reboots (%d/hour) exceeded, manual intervention needed",
+                        LOG_F("看门狗已停止: 1 小时内重启次数过多 (%d 次), 需人工介入",
                               CONFIG_WD_MAX_REBOOTS_PER_HOUR);
                         gpio_set_led_state(LED_BLINK_FAST);  // 快闪 = 需人工介入
                         s_wd.running = false;
@@ -207,7 +207,7 @@ static void watchdog_task(void *pvParameter)
                     uint32_t wait_s = watchdog_get_retry_delay();
                     ESP_LOGI(TAG, "Waiting %lus for server reboot (attempt #%lu, backoff)",
                              (unsigned long)wait_s, (unsigned long)s_wd.consecutive_reboots);
-                    LOG_W("Reboot wait %lus (backoff, attempt #%lu)",
+                    LOG_W("等待服务器重启 %lu 秒 (退避, 第 %lu 次)",
                           (unsigned long)wait_s, (unsigned long)s_wd.consecutive_reboots);
 
                     // 分段延时, 期间允许停止
@@ -218,7 +218,7 @@ static void watchdog_task(void *pvParameter)
                     // 设置开机宽限期
                     s_wd.boot_grace_until_ms = (uint32_t)(esp_timer_get_time() / 1000)
                                                + (CONFIG_WD_BOOT_GRACE_PERIOD_S * 1000);
-                    LOG_I("Boot grace period %us", CONFIG_WD_BOOT_GRACE_PERIOD_S);
+                    LOG_I("开机宽限期 %u 秒", CONFIG_WD_BOOT_GRACE_PERIOD_S);
 
                     watchdog_reset_state();
                     s_wd.state = WD_STATE_HEALTHY;
@@ -319,7 +319,7 @@ void watchdog_notify_response(void)
 
     if (s_wd.state == WD_STATE_WARNING || s_wd.state == WD_STATE_SERVER_DOWN) {
         s_wd.state = WD_STATE_HEALTHY;
-        LOG_I("Server responded, connection restored");
+        LOG_I("服务器已响应, 连接恢复");
     }
 
     // 连续稳定 (无超时) 超过 STABLE_RESET_MS 才重置退避计数。
@@ -330,7 +330,7 @@ void watchdog_notify_response(void)
         } else if (now_ms - s_wd.stable_since_ms >= STABLE_RESET_MS) {
             ESP_LOGI(TAG, "Server stable for %us, resetting consecutive reboot count",
                      (unsigned)(STABLE_RESET_MS / 1000));
-            LOG_I("Server stable, reset consecutive reboot count");
+            LOG_I("服务器稳定运行, 已重置连续重启计数");
             s_wd.consecutive_reboots = 0;
             s_wd.stable_since_ms = 0;
         }

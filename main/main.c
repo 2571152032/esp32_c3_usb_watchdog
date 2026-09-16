@@ -145,7 +145,7 @@ static void system_task(void *pvParameter)
                 // 检查复位按钮是否长按 (在启动时检测)
                 if (gpio_is_button_pressed_long()) {
                     ESP_LOGI(TAG, "Long press detected at boot, clearing config");
-                    LOG_W("Long press at boot -> clear WiFi config");
+                    LOG_W("启动时检测到长按 -> 清除 WiFi 配置");
                     nvs_clear_wifi_config();
                 }
 
@@ -159,7 +159,7 @@ static void system_task(void *pvParameter)
 
             case SYS_STATE_CONFIG_MODE: {
                 ESP_LOGI(TAG, "Entering config mode (AP)...");
-                LOG_I("Entering config (AP) mode");
+                LOG_I("进入配网 (AP) 模式");
                 smart_config_start();
                 // smart_config 会阻塞直到配网完成或超时
                 // 配网完成后重启进入正常运行
@@ -173,12 +173,14 @@ static void system_task(void *pvParameter)
                 nvs_get_wifi_password(password, sizeof(password));
 
                 if (wifi_init_sta(ssid, password) == ESP_OK) {
-                    LOG_I("WiFi connected, entering RUNNING state");
+                    LOG_I("WiFi 已连接, 进入运行状态");
+                    // 启动 SNTP 网络时间同步 (北京时间), 日志时间将显示为绝对时间
+                    event_log_init_sntp();
                     g_system_state = SYS_STATE_RUNNING;
                 } else {
                     // 连接失败，清除配置，进入配网模式
                     ESP_LOGE(TAG, "WiFi connect failed, entering config mode");
-                    LOG_E("WiFi connect failed -> config mode");
+                    LOG_E("WiFi 连接失败 -> 进入配网模式");
                     nvs_clear_wifi_config();
 
                     // 彻底清理 STA 网络栈。否则 smart_config 里再次 esp_wifi_init
@@ -196,7 +198,7 @@ static void system_task(void *pvParameter)
             }
 
             case SYS_STATE_RUNNING: {
-                LOG_I("Entering RUNNING state");
+                LOG_I("进入运行状态");
                 // 启动 USB 看门狗
                 if (usb_device_init() == ESP_OK) {
                     ESP_LOGI(TAG, "USB device initialized");
@@ -204,7 +206,7 @@ static void system_task(void *pvParameter)
                     ESP_LOGI(TAG, "Watchdog started, monitoring server...");
                 } else {
                     ESP_LOGE(TAG, "USB device init failed");
-                    LOG_E("USB device init failed");
+                    LOG_E("USB 设备初始化失败");
                 }
 
                 // 启动 Web 服务器
@@ -291,7 +293,7 @@ void app_main(void)
     //         若 TWDT 不可用 (CONFIG_ESP_TASK_WDT=n), add 会失败, 标志位为 false,
     //         喂狗代码自动跳过, 不会有任何错误日志 —— 降级安全。
     ESP_LOGI(TAG, "Task WDT: reusing the one auto-initialized by IDF (30s timeout)");
-    LOG_I("Task WDT enabled (30s timeout)");
+    LOG_I("任务看门狗已启用 (30 秒超时)");
 
     // 初始化看门狗 (不启动，等 WiFi 连接后再启动)
     watchdog_init();

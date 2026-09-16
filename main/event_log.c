@@ -1,15 +1,12 @@
-/**
- * @file event_log.c
- * @brief 事件日志实现 (RAM 环形缓冲 + NVS 持久化关键事件)
- */
-
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_sntp.h"
 #include "nvs.h"
 
 #include "event_log.h"
@@ -17,27 +14,23 @@
 
 static const char *TAG = "EVT_LOG";
 
-// NVS 存储句柄 (复用 watchdog 命名空间, 单句柄即可)
 static nvs_handle_t s_nvs = 0;
 
 static struct {
     bool initialized;
     log_entry_t ram[LOG_MAX_RAM_ENTRIES];
-    uint32_t ram_head;       // 下一个写入位置
-    uint32_t ram_count;      // 当前有效条数
+    uint32_t ram_head;
+    uint32_t ram_count;
     uint32_t seq_counter;
 } s_log = {0};
 
-// 互斥锁: event_log_write 会被多个任务 (system/watchdog/httpd/usb_rx) 并发调用,
-// 无锁时环形缓冲索引与 NVS 环形头指针的读改写会互相踩踏, 导致日志丢失/错乱。
 static SemaphoreHandle_t s_log_mutex = NULL;
 
 #define LOG_LOCK()   do { if (s_log_mutex) xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(1000)); } while (0)
 #define LOG_UNLOCK() do { if (s_log_mutex) xSemaphoreGive(s_log_mutex); } while (0)
 
-// NVS 环形: log_count / log_head / log_000 .. log_031
 static uint32_t s_nvs_count = 0;
-static uint32_t s_nvs_head  = 0;   // 下一个写入槽位
+static uint32_t s_nvs_head  = 0;
 
 static const char *s_level_str[] = {"INFO", "WARN", "ERROR", "FATAL"};
 
@@ -45,6 +38,52 @@ const char *event_log_level_str(log_level_t level)
 {
     if (level > LOG_LEVEL_FATAL) return "INFO";
     return s_level_str[level];
+}
+
+// ==================== SNTP 网络时间同步 (北京时间) ====================
+
+// Unix 秒有效性阈值 (2021-01-01). 低于它说明 SNTP 尚未同步, time() 仍是 1970 年
+#define WALLCLOCK_MIN_VALID_S   1609459200UL
+
+static bool s_sntp_started = false;
+
+// SNTP 首次同步的时间基准: 用于反推同步前那些只有运行时间的日志条目
+static uint32_t s_sync_wallclock_s  = 0;
+static uint32_t s_sync_timestamp_ms = 0;
+
+bool event_log_time_synced(void)
+{
+    time_t now = time(NULL);
+    return (now > (time_t)WALLCLOCK_MIN_VALID_S);
+}
+
+// SNTP 同步完成回调 (lwip SNTP 线程上下文): 记录一条日志让用户知道时间已校准
+static void sntp_time_sync_cb(struct timeval *tv)
+{
+    if (s_sync_wallclock_s == 0 && tv && tv->tv_sec > WALLCLOCK_MIN_VALID_S) {
+        s_sync_wallclock_s  = (uint32_t)tv->tv_sec;
+        s_sync_timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
+    LOG_I("网络时间已同步 (北京时间)");
+}
+
+void event_log_init_sntp(void)
+{
+    if (s_sntp_started) return;
+    s_sntp_started = true;
+
+    // 时区: 中国标准时间 UTC+8 (POSIX TZ 格式, "CST-8" = UTC+8)
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    // 双服务器冗余: 一个公共池 + 一个国内节点, 提高同步成功率
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "ntp.aliyun.com");
+    esp_sntp_set_time_sync_notification_cb(sntp_time_sync_cb);
+    esp_sntp_init();
+
+    ESP_LOGI(TAG, "SNTP time sync started (TZ=CST-8)");
 }
 
 static void nvs_log_ensure(void)
@@ -65,14 +104,15 @@ static void nvs_log_persist(const log_entry_t *e)
     char key[16];
     snprintf(key, sizeof(key), "log_%03lu", (unsigned long)s_nvs_head);
 
-    // blob: level(1) + timestamp(4) + seq(4) + message(\0 terminated)
-    uint8_t  buf[LOG_MAX_MESSAGE_LEN + 16];
+    uint8_t  buf[LOG_MAX_MESSAGE_LEN + 20];
     uint32_t off = 0;
-    buf[off++] = (uint8_t)e->level;
+    // 最高位作为 v2 格式标志 (含 wallclock_s); level 只有 0-3, 不会冲突
+    buf[off++] = (uint8_t)e->level | 0x80;
     memcpy(buf + off, &e->timestamp_ms, 4); off += 4;
     memcpy(buf + off, &e->seq, 4);          off += 4;
+    memcpy(buf + off, &e->wallclock_s, 4);  off += 4;
     strncpy((char *)buf + off, e->message, LOG_MAX_MESSAGE_LEN - 1);
-    buf[off + LOG_MAX_MESSAGE_LEN - 1] = '\0';   // strncpy 在源串恰好占满 n 字节时不补 NUL, 否则下方 strlen 越界读
+    buf[off + LOG_MAX_MESSAGE_LEN - 1] = '\0';
     off += strlen((char *)buf + off) + 1;
 
     nvs_set_blob(s_nvs, key, buf, off);
@@ -94,7 +134,7 @@ esp_err_t event_log_init(void)
     nvs_log_ensure();
 
     ESP_LOGI(TAG, "Event log initialized (RAM=%d, NVS=%d)", LOG_MAX_RAM_ENTRIES, LOG_MAX_NVS_ENTRIES);
-    LOG_I("System event log initialized");
+    LOG_I("系统事件日志已初始化");
     return ESP_OK;
 }
 
@@ -108,6 +148,8 @@ void event_log_write(log_level_t level, const char *fmt, ...)
     log_entry_t *e = &s_log.ram[s_log.ram_head];
     e->seq          = ++s_log.seq_counter;
     e->timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    // SNTP 已同步则记录绝对时间; 未同步保持 0, 显示时退回运行时间
+    e->wallclock_s  = event_log_time_synced() ? (uint32_t)time(NULL) : 0;
     e->level        = level;
 
     va_list ap;
@@ -118,12 +160,10 @@ void event_log_write(log_level_t level, const char *fmt, ...)
     s_log.ram_head = (s_log.ram_head + 1) % LOG_MAX_RAM_ENTRIES;
     if (s_log.ram_count < LOG_MAX_RAM_ENTRIES) s_log.ram_count++;
 
-    // WARN 及以上持久化
     if (level >= LOG_LEVEL_WARN) {
         nvs_log_persist(e);
     }
 
-    // 同步输出到 ESP_LOG
     ESP_LOGI(TAG, "[%s] %s", s_level_str[level], e->message);
 
     LOG_UNLOCK();
@@ -165,13 +205,20 @@ uint32_t event_log_read_nvs(log_entry_t *entries, uint32_t max_count)
         char       key[16];
         snprintf(key, sizeof(key), "log_%03lu", (unsigned long)slot);
 
-        uint8_t  buf[LOG_MAX_MESSAGE_LEN + 16];
+        uint8_t  buf[LOG_MAX_MESSAGE_LEN + 20];
         size_t   len = sizeof(buf);
         if (nvs_get_blob(s_nvs, key, buf, &len) == ESP_OK && len > 9) {
             uint32_t off = 0;
-            entries[i].level        = (log_level_t)buf[off++];
+            uint8_t  lvl = buf[off++];
+            bool     is_v2 = (lvl & 0x80) != 0;   // v2 含 wallclock_s
+            entries[i].level = (log_level_t)(lvl & 0x7F);
             memcpy(&entries[i].timestamp_ms, buf + off, 4); off += 4;
             memcpy(&entries[i].seq, buf + off, 4);          off += 4;
+            if (is_v2) {
+                memcpy(&entries[i].wallclock_s, buf + off, 4); off += 4;
+            } else {
+                entries[i].wallclock_s = 0;   // 旧格式: 无绝对时间
+            }
             strncpy(entries[i].message, (char *)buf + off, LOG_MAX_MESSAGE_LEN - 1);
             entries[i].message[LOG_MAX_MESSAGE_LEN - 1] = '\0';
         } else {
@@ -207,13 +254,42 @@ esp_err_t event_log_clear_nvs(void)
     return ESP_OK;
 }
 
-const char *event_log_format_time(uint32_t timestamp_ms, char *buf, size_t buf_len)
+const char *event_log_format_time(uint32_t timestamp_ms, uint32_t wallclock_s,
+                                  char *buf, size_t buf_len)
 {
-    if (!buf || buf_len < 16) return "";
+    if (!buf || buf_len < 24) return "";
+
+    // 优先使用条目自带的绝对时间
+    if (wallclock_s <= WALLCLOCK_MIN_VALID_S &&
+        s_sync_wallclock_s > WALLCLOCK_MIN_VALID_S && s_sync_timestamp_ms > 0) {
+        // SNTP 同步后, 根据同步基准反推这条日志发生时的北京时间
+        int64_t diff_ms = (int64_t)s_sync_timestamp_ms - (int64_t)timestamp_ms;
+        time_t  est     = (time_t)((int64_t)s_sync_wallclock_s - diff_ms / 1000);
+        if (est > WALLCLOCK_MIN_VALID_S) {
+            wallclock_s = (uint32_t)est;
+        }
+    }
+
+    if (wallclock_s > WALLCLOCK_MIN_VALID_S) {
+        time_t     t = (time_t)wallclock_s;
+        struct tm  tm_now;
+        localtime_r(&t, &tm_now);
+        strftime(buf, buf_len, "%Y-%m-%d · %H-%M-%S", &tm_now);
+        return buf;
+    }
+
+    // 无任何时间基准时, 退回显示启动后运行时间
     uint32_t total_s = timestamp_ms / 1000;
+    uint32_t days = total_s / 86400;
     uint32_t h = (total_s / 3600) % 24;
     uint32_t m = (total_s / 60)  % 60;
     uint32_t s =  total_s % 60;
-    snprintf(buf, buf_len, "%02lu:%02lu:%02lu", (unsigned long)h, (unsigned long)m, (unsigned long)s);
+    if (days > 0) {
+        snprintf(buf, buf_len, "D%lu %02lu:%02lu:%02lu",
+                 (unsigned long)days, (unsigned long)h, (unsigned long)m, (unsigned long)s);
+    } else {
+        snprintf(buf, buf_len, "%02lu:%02lu:%02lu",
+                 (unsigned long)h, (unsigned long)m, (unsigned long)s);
+    }
     return buf;
 }

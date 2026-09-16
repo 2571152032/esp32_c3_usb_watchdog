@@ -32,7 +32,8 @@ typedef enum {
 
 typedef struct {
     uint32_t    seq;                // 序号
-    uint32_t    timestamp_ms;       // 系统启动后毫秒数
+    uint32_t    timestamp_ms;       // 系统启动后毫秒数 (相对时间, 一直保留)
+    uint32_t    wallclock_s;        // Unix 秒 (绝对时间, 0 = SNTP 尚未同步)
     log_level_t level;
     char        message[LOG_MAX_MESSAGE_LEN];
 } log_entry_t;
@@ -73,9 +74,22 @@ void     event_log_clear_ram(void);
 esp_err_t event_log_clear_nvs(void);
 
 /**
- * @brief 将启动后毫秒数格式化为 "HH:MM:SS"
+ * @brief 启动 SNTP 网络时间同步 (北京时间), 在 WiFi 连接成功后调用
  */
-const char *event_log_format_time(uint32_t timestamp_ms, char *buf, size_t buf_len);
+void event_log_init_sntp(void);
+
+/**
+ * @brief 网络时间是否已同步成功
+ */
+bool event_log_time_synced(void);
+
+/**
+ * @brief 格式化日志时间
+ *        - wallclock_s != 0: 显示北京时间 "YYYY-MM-DD · hh:mm:ss"
+ *        - wallclock_s == 0: SNTP 未同步, 退回显示运行时间 "hh:mm:ss" / "Dx hh:mm:ss"
+ */
+const char *event_log_format_time(uint32_t timestamp_ms, uint32_t wallclock_s,
+                                  char *buf, size_t buf_len);
 
 /**
  * @brief 日志级别字符串

@@ -1,19 +1,3 @@
-/**
- * @file dashboard_html.c
- * @brief 美化后的 Web 控制台 HTML (深色玻璃拟态主题)
- *
- * 页面结构:
- *   - 顶栏: 品牌 + 版本 + 运行时间 + 退出登录
- *   - 状态卡: 脉冲动画 LED + 状态文案 + USB/分区/固件版本
- *   - 统计卡: 心跳 / 响应 / 超时 + 服务器重启次数
- *   - 固件更新 (OTA): 拖拽 / 点击上传 .bin, 校验, 进度条, 刷写详情, 自动重启
- *   - 参数设置 / 修改凭据 / 操作 / 电源状态 / 实时事件日志
- *
- * 通过 dashboard_get_html() 返回模板字符串, 动态值以双花括号占位符表示。
- * 刻意不用 printf 格式符: CSS 中大量百分号 (如 width:100%) 经 snprintf
- * 消费会触发 -Wformat 错误甚至运行时越界, 改用占位符彻底规避。
- */
-
 #include <stdio.h>
 #include "dashboard_html.h"
 
@@ -193,7 +177,7 @@ static const char *s_html =
 "<div><div class=\"k\">固件版本</div><div class=\"v\" id=\"mVer\">上传后解析</div></div>"
 "</div>"
 "<div class=\"progress\" id=\"progress\"><div class=\"bar\" id=\"bar\"></div></div>"
-"<div class=\"hint\" id=\"otaHint\">支持: <span class=\"ok\">.bin (ESP32-C3 分区镜像)</span>。前端以二进制流上传，后端流式写入 OTA 分区。"
+"<div class=\"hint\" id=\"otaHint\">支持: <span class=\"ok\">.bin (OTA 分区镜像)</span>。前端以二进制流上传，后端流式写入 OTA 分区。"
 "流程: <span><b>选择文件 → 校验镜像头 → 写入 Flash → 切换启动分区 → 自动重启</b></span>。"
 "升级期间请勿断电；新固件若启动失败将自动回滚上一版本。</div>"
 "<div class=\"row2\">"
@@ -234,7 +218,10 @@ static const char *s_html =
 "</div>"
 "<!-- 实时事件日志 -->"
 "<div class=\"panel\">"
-"<h3><span class=\"bar\"></span>实时事件日志</h3>"
+"<div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px;\">"
+"<h3 style=\"margin:0\"><span class=\"bar\"></span>实时事件日志</h3>"
+"<button class=\"btn btn-secondary\" onclick=\"clearLogs()\">清除日志</button>"
+"</div>"
 "<div class=\"log\" id=\"log\">加载中...</div>"
 "</div>"
 "</div>"
@@ -352,6 +339,7 @@ static const char *s_html =
 "fetch('/api/reset_wifi',{method:'POST'}).then(function(r){return r.json();}).then(function(d){showToast(d.message||'正在重置...');});}"
 "}"
 "function powerOffServer(){if(confirm('确定强制关机吗？将长按电源键 5 秒。')){fetch('/api/poweroff',{method:'POST'}).then(function(r){return r.json();}).then(function(d){showToast(d.message||'已发送');});}}"
+"function clearLogs(){if(confirm('确定清空所有事件日志？此操作不可恢复。')){fetch('/api/clear_logs',{method:'POST'}).then(function(r){return r.json();}).then(function(d){showToast(d.message||'已清空');refreshLogs();});}}"
 "/* 状态刷新 */"
 "function refreshAll(){"
 "fetch('/api/status').then(function(r){return r.json();}).then(function(d){"

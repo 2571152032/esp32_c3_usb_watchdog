@@ -1,19 +1,3 @@
-/**
- * @file web_server.c
- * @brief Web 控制端实现 (ESP-IDF v6.1 兼容)
- *
- * 安全: 所有页面与 API 均通过 check_auth() 校验登录态 (cookie session),
- *       未登录 → 页面 302 跳转 /login, API 返回 401 JSON.
- *       默认用户名/密码 admin / admin123 (nvs_storage.h 宏定义),
- *       重置网络后恢复为默认值.
- *
- * 功能: 状态监控 / 参数设置 / 修改凭据 / 固件 OTA 更新 (拖拽上传) /
- *       服务器电源控制 / 实时事件日志 / 运行时间
- *
- * OTA 流程: 前端以 application/octet-stream 发送 .bin → 后端校验 (大小/镜像头/分区容量)
- *        → 流式写入 OTA 分区 → esp_ota_set_boot_partition → 延迟重启 → 前端轮询进度
- */
-
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -46,42 +30,18 @@ static httpd_handle_t s_server = NULL;
 #define MAX_USER_LEN    32
 #define MAX_PASS_LEN    64
 
-/* 每次登录成功后随机生成的会话 token。
- * 之前是硬编码常量 "wd_ok", 知道固件源码的人可直接伪造 cookie 绕过登录。 */
 static char s_session_token[33] = {0};   // 32 位 hex + NUL
 
 static esp_err_t get_cookie(httpd_req_t *req, const char *name, char *out, size_t out_len)
 {
-    size_t hdr_len = httpd_req_get_hdr_value_len(req, "Cookie");
-    if (hdr_len == 0) return ESP_FAIL;
-
-    char *hdr = malloc(hdr_len + 1);
-    if (!hdr) return ESP_FAIL;
-    if (httpd_req_get_hdr_value_str(req, "Cookie", hdr, hdr_len + 1) != ESP_OK) {
-        free(hdr);
-        return ESP_FAIL;
+    size_t len = out_len;
+    esp_err_t ret = httpd_req_get_cookie_val(req, name, out, &len);
+    if (ret == ESP_OK) {
+        return ESP_OK;
     }
-
-    char *save;
-    char *token = strtok_r(hdr, ";", &save);
-    while (token) {
-        while (*token == ' ' || *token == '\t') token++;
-        size_t nlen = strlen(name);
-        if (strncmp(token, name, nlen) == 0 && token[nlen] == '=') {
-            strncpy(out, token + nlen + 1, out_len - 1);
-            out[out_len - 1] = '\0';
-            free(hdr);
-            return ESP_OK;
-        }
-        token = strtok_r(NULL, ";", &save);
-    }
-    free(hdr);
     return ESP_FAIL;
 }
 
-/* URL 解码 (application/x-www-form-urlencoded)。
- * 前端用 encodeURIComponent() 编码提交, 而 httpd_query_key_value 只做匹配不解码。
- * 若不解码, 密码里的 & + % 空格 中文 等会以 %26 %2B 形式存入/比对, 登录永远失败。 */
 static void url_decode(char *s)
 {
     static const char hex[] = "0123456789abcdefABCDEF";
@@ -131,22 +91,23 @@ static bool require_auth(httpd_req_t *req, bool is_api)
 
 static void set_login_cookie(httpd_req_t *req)
 {
-    // 每次登录生成随机 token; 重启后 s_session_token 清零, 旧 cookie 自动失效
     uint8_t rnd[16];
     esp_fill_random(rnd, sizeof(rnd));
     for (int i = 0; i < 16; i++) {
         sprintf(&s_session_token[i * 2], "%02x", rnd[i]);
     }
 
-    char cookie[96];
+    static char cookie[128];
     snprintf(cookie, sizeof(cookie),
-             SESSION_COOKIE "=%s; Path=/; HttpOnly; Max-Age=86400", s_session_token);
-    httpd_resp_set_hdr(req, "Set-Cookie", cookie);
+             SESSION_COOKIE "=%s; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax", s_session_token);
+    if (httpd_resp_set_hdr(req, "Set-Cookie", cookie) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set session cookie");
+    }
 }
 
 static void clear_login_cookie(httpd_req_t *req)
 {
-    s_session_token[0] = '\0';   // 服务端立即失效, 旧 cookie 不再可用
+    s_session_token[0] = '\0';
     httpd_resp_set_hdr(req, "Set-Cookie",
         SESSION_COOKIE "=; Path=/; HttpOnly; Max-Age=0");
 }
@@ -214,7 +175,7 @@ static esp_err_t handler_login_page(httpd_req_t *req)
         "<div class=\"card\">"
         "<div class=\"logo\">W</div>"
         "<h1>看门狗控制台</h1>"
-        "<p class=\"sub\">ESP32-C3 USB Watchdog · 请登录</p>"
+        "<p class=\"sub\">Watchdog · 请登录</p>"
         "<form id=\"f\" method=\"POST\" action=\"/login\">"
         "<label>用户名</label>"
         "<input name=\"username\" type=\"text\" placeholder=\"用户名\" required maxlength=\"31\" autocomplete=\"username\">"
@@ -230,12 +191,13 @@ static esp_err_t handler_login_page(httpd_req_t *req)
         "f.addEventListener('submit',function(e){"
         "e.preventDefault();"
         "var d='username='+encodeURIComponent(f.username.value)+'&password='+encodeURIComponent(f.password.value);"
-        "fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:d})"
+        "fetch('/login',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:d})"
         ".then(function(r){return r.json();})"
         ".then(function(d){"
         "if(d.status==='ok'){location.href='/';}"
         "else{err.style.display='block';err.textContent=d.message||'登录失败';}"
-        "});"
+        "})"
+        ".catch(function(e){err.style.display='block';err.textContent='请求失败: '+e.message;});"
         "});"
         "</script>"
         "</body>"
@@ -272,13 +234,13 @@ static esp_err_t handler_login_post(httpd_req_t *req)
 
             if (strcmp(user_in, real_user) == 0 && strcmp(pass_in, real_pass) == 0) {
                 set_login_cookie(req);
-                LOG_I("Web login success: %s", user_in);
+                LOG_I("Web 登录成功: %s", user_in);
                 httpd_resp_set_type(req, "application/json");
                 httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"登录成功\"}", -1);
                 return ESP_OK;
             } else {
                 ESP_LOGW(TAG, "Login failed: user='%s'", user_in);
-                LOG_W("Web login failed: %s", user_in);
+                LOG_W("Web 登录失败: %s", user_in);
             }
         }
     }
@@ -354,12 +316,6 @@ static esp_err_t handler_status(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* JSON 字符串转义。
- * 必要性: 日志内容里会包含 WiFi SSID 等用户输入。若 SSID 含双引号或反斜杠,
- *         直接 %s 拼进去会生成非法 JSON, 前端 r.json() 抛异常, 日志面板
- *         直接空白。含 < > 时还会破坏 innerHTML 渲染 (注入)。
- * 输出缓冲区建议 >= 原文长度 * 2 + 1。
- */
 static void json_escape(const char *in, char *out, size_t out_size)
 {
     if (out_size == 0) return;
@@ -372,7 +328,6 @@ static void json_escape(const char *in, char *out, size_t out_size)
             case '\n': memcpy(out + o, "\\n", 2);  o += 2; break;
             case '\r': memcpy(out + o, "\\r", 2);  o += 2; break;
             case '\t': memcpy(out + o, "\\t", 2);  o += 2; break;
-            // 同时转义 HTML 敏感字符, 防止日志内容破坏页面 / 注入
             case '<':  memcpy(out + o, "\\u003c", 6); o += 6; break;
             case '>':  memcpy(out + o, "\\u003e", 6); o += 6; break;
             case '&':  memcpy(out + o, "\\u0026", 6); o += 6; break;
@@ -391,14 +346,6 @@ static esp_err_t handler_logs(httpd_req_t *req)
 {
     if (!require_auth(req, true)) return ESP_OK;
 
-    // 注意: log_entry_t 约 140 字节, 若放栈上会撑爆 httpd 任务栈
-    //       (Stack protection fault 崩溃), 因此全部改用堆分配。
-    //
-    // 数量取舍: 64 条 → 32 条。
-    //   ESP32-C3 空闲堆约 80-110KB, 而 dashboard 页面本身要 ~20KB (模板渲染)。
-    //   前端每 4s 轮询 /api/logs, 若与 dashboard 请求并发, 旧版 33KB + 20KB
-    //   会明显加剧堆碎片, 极端情况下分配失败返回 500。
-    //   32+32=64 条足够展示 (前端只显示最近若干条), 内存降到约 25KB。
     const uint32_t ram_max = 32, nvs_max = 32;
     log_entry_t *ram = calloc(ram_max, sizeof(log_entry_t));
     log_entry_t *nvs = calloc(nvs_max, sizeof(log_entry_t));
@@ -408,12 +355,19 @@ static esp_err_t handler_logs(httpd_req_t *req)
         return ESP_OK;
     }
 
-    // 合并 RAM (最近) + NVS (持久) 日志, 前端按时间倒序展示
     uint32_t ram_cnt = event_log_read(ram, ram_max);
     uint32_t nvs_cnt = event_log_read_nvs(nvs, nvs_max);
 
-    // 单条 JSON 最坏约 168 字节 (time+level+127 字符 msg), 64 条 → 约 10.8KB。
-    // 给 16KB 留足余量。
+    // NVS 中 WARN+ 条目与本次 RAM 里的同 seq 条目重复, 去重
+    bool *nvs_skip = calloc(nvs_cnt, sizeof(bool));
+    if (nvs_skip) {
+        for (uint32_t i = 0; i < nvs_cnt; i++) {
+            for (uint32_t j = 0; j < ram_cnt; j++) {
+                if (nvs[i].seq == ram[j].seq) { nvs_skip[i] = true; break; }
+            }
+        }
+    }
+
     const size_t cap = 16384;
     char *json = malloc(cap);
     if (!json) {
@@ -422,36 +376,28 @@ static esp_err_t handler_logs(httpd_req_t *req)
         return ESP_OK;
     }
 
-    // 剩余空间计算: 必须防止下溢!
-    // 若 p 越过 json+cap, "cap - (p - json)" 是无符号数会下溢成巨大值,
-    // snprintf 就会疯狂越界写 —— 这是比栈溢出更隐蔽的崩溃源。
 #define JSON_LEFT()  ((size_t)(p - json) >= cap ? (size_t)0 : (size_t)(cap - (size_t)(p - json)))
 
     char *p = json;
     p += snprintf(p, JSON_LEFT(), "{\"ram_count\":%lu,\"nvs_count\":%lu,\"entries\":[",
                   (unsigned long)ram_cnt, (unsigned long)nvs_cnt);
 
-    // 先输出持久化日志 (旧), 再输出 RAM (新)
     bool first = true;
     bool truncated = false;
     const log_entry_t *lists[2] = { nvs, ram };
     const uint32_t counts[2]    = { nvs_cnt, ram_cnt };
 
-    // message 最长 (LOG_MAX_MESSAGE_LEN-1)=127 字符; 最坏情况每个字符都转成
-    // \uXXXX (6 字节) → 需要 127*6=762 字节。给 6 倍 + 8 保证绝不截断。
     char esc[LOG_MAX_MESSAGE_LEN * 6 + 8];
 
     for (int l = 0; l < 2 && !truncated; l++) {
         for (uint32_t i = 0; i < counts[l]; i++) {
-            char tbuf[16];
-            event_log_format_time(lists[l][i].timestamp_ms, tbuf, sizeof(tbuf));
+            if (l == 0 && nvs_skip && nvs_skip[i]) continue;
+            char tbuf[32];
+            event_log_format_time(lists[l][i].timestamp_ms, lists[l][i].wallclock_s,
+                                  tbuf, sizeof(tbuf));
             json_escape(lists[l][i].message, esc, sizeof(esc));
-            // 预留 2 字节收尾 "]}" + 至少 1 字节逗号/条目
             if (JSON_LEFT() < 320) { truncated = true; break; }
             int n = snprintf(p, JSON_LEFT(),
-                /* 字段名必须是 "message":
-                 * 与 log_entry_t.message 一致, 也和前端 e.message 直觉对应。
-                 * 曾因写成 "msg" 导致前端取不到值, 日志面板整列显示 undefined。 */
                 "%s{\"time\":\"%s\",\"level\":%d,\"message\":\"%s\"}",
                 first ? "" : ",", tbuf, (int)lists[l][i].level, esc);
             if (n < 0 || (size_t)n >= JSON_LEFT()) { truncated = true; break; }
@@ -461,14 +407,14 @@ static esp_err_t handler_logs(httpd_req_t *req)
     }
 #undef JSON_LEFT
 
-    // 收尾 (确保有空间)
     if ((size_t)(p - json) + 3 < cap) {
         p += snprintf(p, 3, "]}");
     } else {
-        strcpy(json + cap - 3, "]}");   // 极端情况: 直接覆盖末尾
+        strcpy(json + cap - 3, "]}");
     }
     (void)truncated;
 
+    free(nvs_skip);
     free(ram);
     free(nvs);
 
@@ -481,10 +427,12 @@ static esp_err_t handler_logs(httpd_req_t *req)
 static void reboot_task(void *pv)
 {
     ESP_LOGI(TAG, "Web 触发服务器重启");
-    LOG_W("Web triggered server GPIO reset");
+    LOG_W("Web 触发服务器 GPIO 复位");
     gpio_trigger_server_reset(500);
     vTaskDelete(NULL);
 }
+
+
 
 static esp_err_t handler_reboot(httpd_req_t *req)
 {
@@ -498,6 +446,7 @@ static esp_err_t handler_reboot(httpd_req_t *req)
 static void poweron_task(void *pv)
 {
     ESP_LOGI(TAG, "Web 触发服务器开机");
+    LOG_I("Web 触发服务器开机");
     gpio_trigger_server_poweron(0);
     vTaskDelete(NULL);
 }
@@ -514,6 +463,7 @@ static esp_err_t handler_poweron(httpd_req_t *req)
 static void poweroff_task(void *pv)
 {
     ESP_LOGW(TAG, "Web 触发强制关机 (长按 5 秒)");
+    LOG_W("Web 触发强制关机 (长按 5 秒)");
     gpio_force_poweroff();
     vTaskDelete(NULL);
 }
@@ -559,8 +509,7 @@ static esp_err_t handler_settings(httpd_req_t *req)
         uint32_t timeout = (uint32_t)atoi(timeout_str);
 
         if (interval < 1) interval = 1;
-        if (timeout < 60) timeout = 60;   // 10 分钟超时策略, 下限 60s
-        // 上限钳制: 超大 interval 会在看门狗里 interval*1000 溢出 uint32
+        if (timeout < 60) timeout = 60;
         if (interval > 86400) interval = 86400;
         if (timeout > 86400) timeout = 86400;
 
@@ -569,9 +518,8 @@ static esp_err_t handler_settings(httpd_req_t *req)
 
         ESP_LOGI(TAG, "参数已更新: interval=%lu, timeout=%lu",
                  (unsigned long)interval, (unsigned long)timeout);
-        LOG_I("Heartbeat params updated: %lus / %lus", (unsigned long)interval, (unsigned long)timeout);
+        LOG_I("心跳参数已更新: %lu 秒 / %lu 秒", (unsigned long)interval, (unsigned long)timeout);
     } else {
-        // 之前 query 解析失败时静默跳过并返回 "已保存", 误导前端
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"缺少 interval/timeout 参数\"}", -1);
@@ -618,8 +566,7 @@ static esp_err_t handler_change_password(httpd_req_t *req)
         if (strlen(new_user) == 0) {
             strcpy(new_user, real_user);
         }
-        // 只改用户名、新密码留空时保留原密码。
-        // 之前会把空密码写进 NVS, 之后用脚本提交空密码即可登录。
+
         if (strlen(new_pass) == 0) {
             strcpy(new_pass, real_pass);
         }
@@ -630,7 +577,7 @@ static esp_err_t handler_change_password(httpd_req_t *req)
             return ESP_OK;
         }
 
-        LOG_I("Web credentials updated by %s", real_user);
+        LOG_I("登录凭据已更新 (操作者: %s)", real_user);
         clear_login_cookie(req);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"凭据已更新，请重新登录\"}", -1);
@@ -649,7 +596,7 @@ static void firmware_reboot_task(void *pv)
     // 延迟重启, 确保 "刷写成功" 的 HTTP 响应已发回前端
     vTaskDelay(pdMS_TO_TICKS(2500));
     ESP_LOGI(TAG, "OTA rebooting...");
-    LOG_W("OTA rebooting device");
+    LOG_W("OTA 正在重启设备");
     esp_restart();
     vTaskDelete(NULL);
 }
@@ -713,12 +660,12 @@ static esp_err_t handler_firmware(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Firmware upload: %ld bytes, partition=%s (%lu KB free)",
              (long)req->content_len, next->label, (unsigned long)(next->size / 1024));
-    LOG_I("Firmware upload start: %ld bytes", (long)req->content_len);
+    LOG_I("开始上传固件: %ld 字节", (long)req->content_len);
 
     esp_err_t ret = ota_handle_raw_upload(req, (uint32_t)req->content_len);
 
     if (ret == ESP_OK) {
-        LOG_I("Firmware flashed OK, scheduling reboot");
+        LOG_I("固件刷写成功, 准备重启设备");
         xTaskCreate(firmware_reboot_task, "fw_reboot", 2048, NULL, 5, NULL);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"固件刷写成功，设备即将重启...\"}", -1);
@@ -788,7 +735,12 @@ static esp_err_t handler_reset_wifi(httpd_req_t *req)
     if (!require_auth(req, true)) return ESP_OK;
 
     ESP_LOGI(TAG, "Web 请求重置 WiFi (将恢复默认账号密码)");
-    LOG_W("Web triggered WiFi reset (credentials -> default)");
+    LOG_W("Web 触发 WiFi 重置 (凭据已恢复默认)");
+
+    // 恢复默认时同时清空事件日志, 避免旧日志继续堆积
+    event_log_clear_ram();
+    event_log_clear_nvs();
+
     nvs_clear_wifi_config();   // 内部会调用 nvs_restore_default_credentials()
 
     httpd_resp_set_type(req, "application/json");
@@ -796,6 +748,17 @@ static esp_err_t handler_reset_wifi(httpd_req_t *req)
 
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
+    return ESP_OK;
+}
+
+static esp_err_t handler_clear_logs(httpd_req_t *req)
+{
+    if (!require_auth(req, true)) return ESP_OK;
+    event_log_clear_ram();
+    event_log_clear_nvs();
+    LOG_I("Web 清除事件日志");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"日志已清空\"}", -1);
     return ESP_OK;
 }
 
@@ -808,7 +771,6 @@ static esp_err_t handler_favicon(httpd_req_t *req)
 
 // ==================== Dashboard (美化版) ====================
 
-/* ---- {{KEY}} 占位符替换 (替代 printf, 避免 CSS 里的 % 被当作格式符) ---- */
 static void ph_replace(char *buf, size_t buf_size, const char *key, const char *val)
 {
     size_t klen = strlen(key), vlen = strlen(val);
@@ -816,8 +778,8 @@ static void ph_replace(char *buf, size_t buf_size, const char *key, const char *
     while ((pos = strstr(pos, key)) != NULL) {
         size_t used = (size_t)(pos - buf);
         size_t tail = strlen(pos + klen);
-        if (used + vlen + tail + 1 > buf_size) return;   /* 空间不足则放弃, 保证不越界 */
-        memmove(pos + vlen, pos + klen, tail + 1);       /* 连同结尾 '\0' 一起搬 */
+        if (used + vlen + tail + 1 > buf_size) return;
+        memmove(pos + vlen, pos + klen, tail + 1);
         memcpy(pos, val, vlen);
         pos += vlen;
     }
@@ -862,12 +824,10 @@ static esp_err_t handler_dashboard(httpd_req_t *req)
     const char *part_name = running ? running->label : "-";
 
     // 注意: esp_ota_get_app_description() 自 IDF v5.0 起已废弃并移除,
-    //       正确写法是 esp_app_get_description() (属于 esp_app_format 组件)。
     const esp_app_desc_t *app_desc = esp_app_get_description();
     const char *version = (app_desc && strlen(app_desc->version) > 0) ? app_desc->version : "unknown";
     const char *build_date = (app_desc && strlen(app_desc->date) > 0) ? app_desc->date : "unknown";
 
-    // 用 {{KEY}} 占位符做字符串替换 (不经 printf, 避免 CSS 中的 % 被当格式符)
     const char *tpl = dashboard_get_html();
 
     size_t cap = strlen(tpl) + 512;
@@ -918,13 +878,9 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    // 栈大小: 默认 4096 不够用。
-    // handler_dashboard 要 snprintf 渲染 ~22KB 的 HTML 模板 (栈上还有局部缓冲),
-    // 历史版本在 8192 下仍会因 /api/logs 的日志数组撑爆栈而 panic
-    // (Guru Meditation: Stack protection fault)。这里放大到 12288 留足余量。
     config.stack_size = 12288;
     config.max_uri_handlers = 32;
-    // OTA 上传可能耗时较长, 适当放大请求超时
+    config.max_resp_headers = 16;
     config.lru_purge_enable = true;
 
     esp_err_t ret = httpd_start(&s_server, &config);
@@ -952,6 +908,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/firmware",         .method = HTTP_POST, .handler = handler_firmware },
         { .uri = "/api/ota/status",       .method = HTTP_GET,  .handler = handler_ota_status },
         { .uri = "/api/reset_wifi",       .method = HTTP_POST, .handler = handler_reset_wifi },
+        { .uri = "/api/clear_logs",       .method = HTTP_POST, .handler = handler_clear_logs },
         { .uri = "/favicon.ico",          .method = HTTP_GET,  .handler = handler_favicon },
     };
 
