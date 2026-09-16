@@ -93,3 +93,17 @@ uint32_t uptime_get_reboots(void)
 {
     return s_up.total_reboots;
 }
+
+void uptime_reset_reboots(void)
+{
+    if (!s_up.initialized) return;
+    s_up.total_reboots = 0;
+
+    nvs_ensure();
+    if (s_nvs) {
+        nvs_set_u32(s_nvs, "srv_reboots", 0);
+        nvs_commit(s_nvs);
+    }
+    ESP_LOGI(TAG, "Server reboot count reset");
+    LOG_I("服务器重启计数已清零");
+}

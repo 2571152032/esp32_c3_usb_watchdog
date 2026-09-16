@@ -310,6 +310,18 @@ void watchdog_get_stats(watchdog_stats_t *stats)
     stats->consecutive_timeouts = s_wd.consecutive_timeouts;
 }
 
+void watchdog_reset_stats(void)
+{
+    s_wd.heartbeat_count      = 0;
+    s_wd.response_count       = 0;
+    s_wd.timeout_count        = 0;
+    s_wd.consecutive_timeouts = 0;
+    s_wd.last_heartbeat_ms    = 0;
+    s_wd.last_response_ms     = 0;
+    ESP_LOGI(TAG, "Watchdog stats reset");
+    LOG_I("心跳统计已清零");
+}
+
 void watchdog_notify_response(void)
 {
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);

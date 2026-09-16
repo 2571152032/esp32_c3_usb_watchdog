@@ -512,10 +512,12 @@ static esp_err_t handler_settings(httpd_req_t *req)
         uint32_t interval = (uint32_t)atoi(interval_str);
         uint32_t timeout = (uint32_t)atoi(timeout_str);
 
+        /* 最大值 / 最小值约束, 防止无效参数 */
         if (interval < 1) interval = 1;
-        if (timeout < 60) timeout = 60;
-        if (interval > 86400) interval = 86400;
-        if (timeout > 86400) timeout = 86400;
+        if (interval > 3600) interval = 3600;   // 上限 1 小时, 避免 uint32 溢出与无意义周期
+        if (timeout < 60) timeout = 60;         // 至少 1 分钟
+        if (timeout > 86400) timeout = 86400;  // 上限 24 小时
+        if (timeout < interval * 2) timeout = interval * 2;  // 超时至少是间隔的 2 倍
 
         watchdog_set_params(interval, timeout);
         nvs_save_heartbeat_params(interval, timeout);
@@ -532,6 +534,21 @@ static esp_err_t handler_settings(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"参数已保存\"}", -1);
+    return ESP_OK;
+}
+
+static esp_err_t handler_reset_stats(httpd_req_t *req)
+{
+    if (!require_auth(req, true)) return ESP_OK;
+
+    watchdog_reset_stats();
+    uptime_reset_reboots();
+
+    ESP_LOGI(TAG, "Web 清零心跳统计");
+    LOG_I("Web 清零心跳统计");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"统计已清零\"}", -1);
     return ESP_OK;
 }
 
@@ -913,6 +930,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/ota/status",       .method = HTTP_GET,  .handler = handler_ota_status },
         { .uri = "/api/reset_wifi",       .method = HTTP_POST, .handler = handler_reset_wifi },
         { .uri = "/api/clear_logs",       .method = HTTP_POST, .handler = handler_clear_logs },
+        { .uri = "/api/reset_stats",      .method = HTTP_POST, .handler = handler_reset_stats },
         { .uri = "/favicon.ico",          .method = HTTP_GET,  .handler = handler_favicon },
     };
 

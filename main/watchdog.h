@@ -101,6 +101,11 @@ watchdog_state_t watchdog_get_state(void);
 void watchdog_get_stats(watchdog_stats_t *stats);
 
 /**
+ * @brief 清零运行时统计 (心跳数 / 响应数 / 超时数 / 连续超时), 不影响参数与状态
+ */
+void watchdog_reset_stats(void);
+
+/**
  * @brief 通知收到心跳响应 (由 USB 回调调用)
  */
 void watchdog_notify_response(void);

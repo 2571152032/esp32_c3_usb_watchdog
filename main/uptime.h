@@ -38,6 +38,11 @@ void uptime_inc_reboots(void);
  */
 uint32_t uptime_get_reboots(void);
 
+/**
+ * @brief 清零累计服务器重启次数 (NVS + 内存)
+ */
+void uptime_reset_reboots(void);
+
 #ifdef __cplusplus
 }
 #endif
