@@ -14,6 +14,7 @@
 
 #include "uptime.h"
 #include "nvs_storage.h"
+#include "event_log.h"
 
 #define TAG "UPTIME"
 
