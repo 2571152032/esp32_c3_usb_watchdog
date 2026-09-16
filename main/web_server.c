@@ -294,6 +294,8 @@ static esp_err_t handler_status(httpd_req_t *req)
         "\"consecutive_timeouts\":%lu,"
         "\"uptime_s\":%lu,"
         "\"reboots\":%lu,"
+        "\"wallclock_s\":%lu,"
+        "\"time_synced\":%s,"
         "\"ota\":{\"state\":%d,\"progress\":%u,\"received\":%lu,\"total\":%lu}"
         "}",
         (int)stats.state,
@@ -305,6 +307,8 @@ static esp_err_t handler_status(httpd_req_t *req)
         (unsigned long)stats.consecutive_timeouts,
         (unsigned long)uptime_get_seconds(),
         (unsigned long)uptime_get_reboots(),
+        (unsigned long)(event_log_time_synced() ? time(NULL) : 0UL),
+        event_log_time_synced() ? "true" : "false",
         (int)ota.state,
         (unsigned int)ota.progress,
         (unsigned long)ota.received_bytes,
