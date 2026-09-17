@@ -159,6 +159,7 @@ OTA 上传流程为完整模拟演示。<b>真实固件</b>请编译烧录本项
 <div class="stat"><div class="label">响应数</div><div class="value" id="respCount">1245<span class="small">次</span></div></div>
 <div class="stat"><div class="label">超时数</div><div class="value" id="tmoCount">2<span class="small">次</span></div></div>
 <div class="stat"><div class="label">服务器已重启</div><div class="value" id="rbCount">3<span class="small">次</span></div></div>
+<div class="stat"><div class="label">连续重启 (自动保护计数)</div><div class="value" id="consecReboots">0<span class="small">次</span></div></div>
 </div>
 </div>
 <!-- 服务器电源状态 -->
@@ -213,6 +214,30 @@ OTA 上传流程为完整模拟演示。<b>真实固件</b>请编译烧录本项
 <button class="btn btn-primary" onclick="changePassword()">更新用户名 / 密码</button>
 </div>
 </div>
+<!-- 自动保护 / 通知 -->
+<div class="panel">
+<h3><span class="bar"></span>自动保护 &amp; 告警通知</h3>
+<label style="display:flex;align-items:flex-start;gap:10px;margin-top:4px;cursor:pointer">
+<input type="checkbox" id="poweroffEnabled" checked style="width:18px;height:18px;flex:none;margin-top:1px">
+<span>连续 <b>3</b> 次重启服务器后仍未恢复时, 自动强制关机 (关机后需人工开机)</span>
+</label>
+<label style="display:flex;align-items:flex-start;gap:10px;margin-top:14px;cursor:pointer">
+<input type="checkbox" id="notifyEnabled" checked style="width:18px;height:18px;flex:none;margin-top:1px">
+<span>触发强制关机 / 看门狗停止时, 向下面的地址推送通知</span>
+</label>
+<label>通知推送地址 (Webhook URL)</label>
+<input type="text" id="notifyUrl" value="https://api.day.app/你的KEY/{TITLE}/{MSG}" maxlength="192" placeholder="https://api.day.app/你的KEY/标题/内容">
+<div class="hint">
+支持任意 <b>HTTP(S) GET</b> 接口 (最多 192 字符), 地址中的 <b>{TITLE}</b> 与 <b>{MSG}</b> 会被替换为标题和内容 (自动 URL 编码)。<br>
+Bark: <b>https://api.day.app/你的KEY/{TITLE}/{MSG}</b><br>
+Server酱: <b>https://sctapi.ftqq.com/你的KEY.send?title={TITLE}&amp;desp={MSG}</b><br>
+Telegram: <b>https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage?chat_id=&lt;ID&gt;&amp;text={MSG}</b>
+</div>
+<div class="row2">
+<button class="btn btn-primary" onclick="saveProtect()">保存设置</button>
+<button class="btn btn-secondary" onclick="testNotify()">发送测试通知</button>
+</div>
+</div>
 <!-- 操作 -->
 <div class="panel">
 <h3><span class="bar"></span>服务器电源控制</h3>
@@ -240,6 +265,12 @@ var sim = {
   interval: 60,
   timeout: 600,
   hb: 1247, resp: 1245, tmo: 2, reboots: 3,
+  consecReboots: 0,          // 连续重启计数 (自动保护)
+  okStreak: 0,               // 连续正常响应次数 (用于模拟稳定后清零)
+  watchdogRunning: true,     // 监控任务是否运行 (强制关机后为 false)
+  poweroffEnabled: true,     // 连续 3 次重启后强制关机
+  notifyEnabled: true,       // 告警通知
+  notifyUrl: 'https://api.day.app/你的KEY/{TITLE}/{MSG}',
   powerOn: true,
   bootTime: Date.now() - 3 * 3600 * 1000 - 17 * 60 * 1000,  // 已运行 3h17m
   logs: [],
@@ -276,15 +307,30 @@ function fmtTime(ts){
 setInterval(function(){
   if (sim.ota.state !== 'idle') return;   // OTA 期间暂停
   if (!sim.usb) return;
+  if (!sim.watchdogRunning) return;       // 强制关机后监控已停止
   sim.hb++;
   var r = Math.random();
   if (r < 0.06) {          // 6% 心跳无响应 → 超时
     sim.tmo++;
     pushLog(2, '心跳无响应 (' + sim.interval + 's) — 剩余超时倒计时 ' + sim.timeout + 's');
     if (sim.state !== 'down' && Math.random() < 0.4) {
-      sim.state = 'down'; sim.reboots++;
+      sim.state = 'down'; sim.reboots++; sim.consecReboots++; sim.okStreak = 0;
       pushLog(2, '判定服务器宕机！GPIO 复位脉冲已发送 (RESET 200ms)');
       pushLog(0, '等待服务器重启...');
+
+      /* 连续 3 次重启仍未恢复 -> 强制关机 + 通知 (与固件逻辑一致) */
+      if (sim.poweroffEnabled && sim.consecReboots >= 3) {
+        sim.powerOn = false;
+        sim.watchdogRunning = false;
+        sim.state = 'idle';
+        pushLog(2, '连续 3 次重启后服务器仍未恢复 -> 触发强制关机 (长按 PWR_BTN 5s)');
+        pushLog(0, sim.notifyEnabled && sim.notifyUrl
+          ? '通知推送: [看门狗告警] 已强制关机，请人工介入'
+          : '通知未启用，跳过推送');
+        renderPower(); renderStatus();
+        return;
+      }
+
       setTimeout(function(){
         sim.state = 'healthy';
         pushLog(0, '服务器已恢复，心跳正常');
@@ -293,6 +339,14 @@ setInterval(function(){
     }
   } else {                 // 正常响应
     sim.resp++;
+    sim.okStreak++;
+    if (sim.okStreak >= 8) {   // 模拟"稳定运行 5 分钟"后清零连续重启计数
+      sim.okStreak = 0;
+      if (sim.consecReboots > 0) {
+        sim.consecReboots = 0;
+        pushLog(0, '服务器稳定运行，连续重启计数已清零');
+      }
+    }
     if (r < 0.14) {
       sim.state = 'warning';
       pushLog(1, '心跳响应缓慢，接近超时阈值');
@@ -317,6 +371,10 @@ function apiStatus(){
     response_count: sim.resp,
     timeout_count: sim.tmo,
     reboot_count: sim.reboots,
+    consecutive_reboots: sim.consecReboots,
+    watchdog_running: sim.watchdogRunning,
+    poweroff_enabled: sim.poweroffEnabled,
+    notify_enabled: sim.notifyEnabled,
     uptime_sec: Math.floor((Date.now() - sim.bootTime) / 1000)
   };
 }
@@ -345,8 +403,16 @@ function renderStatus(){
   document.getElementById('respCount').innerHTML = sim.resp + '<span class="small">次</span>';
   document.getElementById('tmoCount').innerHTML = sim.tmo + '<span class="small">次</span>';
   document.getElementById('rbCount').innerHTML = sim.reboots + '<span class="small">次</span>';
+  document.getElementById('consecReboots').innerHTML = sim.consecReboots + '<span class="small">次</span>';
   document.getElementById('itvTxt').textContent = sim.interval + ' s';
   document.getElementById('tmoTxt').textContent = sim.timeout + ' s';
+  /* 看门狗已停止(强制关机 / 重启过多)时给出明显提示, 覆盖上面的状态显示 */
+  if (!sim.watchdogRunning) {
+    st.textContent = '看门狗已停止 · 需人工介入'; st.style.color = '#ef4444';
+    led.style.background = '#ef4444';
+    led.style.boxShadow = '0 0 0 8px rgba(239,68,68,.12),0 0 40px rgba(239,68,68,.35)';
+    led.classList.remove('pulse');
+  }
 }
 function renderPower(){
   var el = document.getElementById('powerState');
@@ -395,10 +461,34 @@ function changePassword(){
   showToast('已更新，请重新登录 (模拟)');
 }
 
+/* 自动保护 / 通知 */
+function saveProtect(){
+  var po = document.getElementById('poweroffEnabled').checked;
+  var ne = document.getElementById('notifyEnabled').checked;
+  var nu = document.getElementById('notifyUrl').value.trim();
+  if (ne && !nu) { showToast('已启用通知，请先填写推送地址', 'warn'); return; }
+  if (nu && !/^https?:\/\//i.test(nu)) { showToast('推送地址需以 http:// 或 https:// 开头', 'warn'); return; }
+  sim.poweroffEnabled = po; sim.notifyEnabled = ne; sim.notifyUrl = nu;
+  pushLog(0, '自动保护设置已保存: 强制关机 ' + (po ? '启用' : '禁用') +
+             ' / 通知 ' + (ne ? '启用' : '禁用') + ' (已写入 NVS)');
+  showToast('设置已保存 (模拟 NVS 写入)');
+}
+function testNotify(){
+  if (!sim.notifyEnabled || !sim.notifyUrl) { showToast('请先启用通知并填写推送地址', 'warn'); return; }
+  pushLog(0, '通知推送: [看门狗测试] 这是一条来自 ESP32-C3 看门狗的测试通知');
+  showToast('测试通知已发送, 请查看接收端');
+}
+
 function powerOnServer(){
   if (confirm('向服务器发送开机信号？')) {
     sim.powerOn = true; renderPower();
     pushLog(0, 'GPIO 开机脉冲已发送 (PWR_BTN 200ms)');
+    /* 人工开机 = 人工介入: 清零连续重启计数并恢复监控 */
+    if (sim.consecReboots > 0 || !sim.watchdogRunning) {
+      sim.consecReboots = 0; sim.okStreak = 0; sim.watchdogRunning = true;
+      pushLog(0, '看门狗已恢复监控 (连续重启计数已清零)');
+      renderStatus();
+    }
     showToast('开机信号已发送');
   }
 }

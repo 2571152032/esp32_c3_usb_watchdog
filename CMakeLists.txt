@@ -6,7 +6,7 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # 固件版本号: 写入镜像 esp_app_desc_t.version,
 # Web 控制台 {{VERSION}} 占位符与 OTA 页面前端解析的均为此值。
 # (须在 project() 之前设置; 不设置时 IDF 会回退为 git describe 或编译日期)
-set(PROJECT_VER "1.2.32")
+set(PROJECT_VER "1.3")
 
 project(esp32_c3_usb_watchdog)
 

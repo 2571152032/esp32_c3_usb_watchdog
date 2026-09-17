@@ -42,6 +42,9 @@ uint32_t watchdog_get_trend_count(void);
 #ifndef CONFIG_WD_BOOT_GRACE_PERIOD_S
 #define CONFIG_WD_BOOT_GRACE_PERIOD_S   180  // 服务器开机后宽限期 (秒, 期间不计超时)
 #endif
+#ifndef WD_AUTO_POWEROFF_AFTER_REBOOTS
+#define WD_AUTO_POWEROFF_AFTER_REBOOTS  3    // 连续重启达到该次数后触发强制关机
+#endif
 
 // 指数退避: 重启后等待时间 (秒): 30/60/120/240/300
 uint32_t watchdog_get_retry_delay(void);
@@ -55,6 +58,9 @@ typedef struct {
     uint32_t response_count;        // 已收到响应计数
     uint32_t timeout_count;         // 超时计数
     uint32_t consecutive_timeouts;  // 连续超时次数
+    uint32_t consecutive_reboots;   // 连续重启次数 (稳定运行 5 分钟后自动清零)
+    bool     running;               // 监控任务是否在运行
+    bool     auto_poweroff_enabled; // 连续多次重启后是否强制关机
 } watchdog_stats_t;
 
 /**
@@ -124,6 +130,22 @@ void watchdog_get_params(uint32_t *interval_s, uint32_t *timeout_s);
  * @brief 注册服务器宕机回调 (GPIO 复位在此触发)
  */
 void watchdog_register_server_down_callback(void (*cb)(void));
+
+/**
+ * @brief 启用 / 禁用 "连续多次重启后强制关机"
+ */
+void watchdog_set_auto_poweroff(bool enabled);
+
+/**
+ * @brief 查询 "连续多次重启后强制关机" 是否启用
+ */
+bool watchdog_get_auto_poweroff(void);
+
+/**
+ * @brief 恢复监控 (强制关机后由人工开机时调用)
+ *        清零连续重启计数与退避, 并在任务已停止时重新拉起
+ */
+esp_err_t watchdog_resume(void);
 
 #ifdef __cplusplus
 }

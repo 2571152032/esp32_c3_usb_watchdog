@@ -23,6 +23,7 @@
 #include "gpio_control.h"
 #include "uptime.h"
 #include "event_log.h"
+#include "notify.h"
 
 #define TAG "WATCHDOG"
 
@@ -53,6 +54,9 @@ static struct {
     uint32_t consecutive_reboots;     // 连续重启次数 (指数退避)
     uint32_t boot_grace_until_ms;     // 开机宽限期结束时刻
     uint32_t stable_since_ms;         // 恢复后连续无超时的起始时刻 (0=未开始计时)
+
+    // === 自动保护 ===
+    bool auto_poweroff_enabled;       // 连续多次重启后是否强制关机
 } s_wd = {0};
 
 // ==================== 趋势环形缓冲 ====================
@@ -193,7 +197,34 @@ static void watchdog_task(void *pvParameter)
                                  CONFIG_WD_MAX_REBOOTS_PER_HOUR);
                         LOG_F("看门狗已停止: 1 小时内重启次数过多 (%d 次), 需人工介入",
                               CONFIG_WD_MAX_REBOOTS_PER_HOUR);
+                        notify_send_async("看门狗已停止",
+                                          "1 小时内重启次数过多, 已停止自动重启, 需人工介入");
                         gpio_set_led_state(LED_BLINK_FAST);  // 快闪 = 需人工介入
+                        s_wd.running = false;
+                        break;
+                    }
+
+                    // 连续多次重启后服务器仍未恢复 -> 触发强制关机 (可禁用), 并推送通知
+                    if (s_wd.auto_poweroff_enabled &&
+                        s_wd.consecutive_reboots >= WD_AUTO_POWEROFF_AFTER_REBOOTS) {
+                        ESP_LOGE(TAG, "Consecutive reboots reached %d - forcing server power off",
+                                 WD_AUTO_POWEROFF_AFTER_REBOOTS);
+                        LOG_F("连续 %d 次重启后服务器仍未恢复 -> 触发强制关机 (需人工开机)",
+                              WD_AUTO_POWEROFF_AFTER_REBOOTS);
+
+                        char alert[160];
+                        snprintf(alert, sizeof(alert),
+                                 "服务器连续 %d 次重启后仍未恢复, 看门狗已执行强制关机, 请人工介入",
+                                 WD_AUTO_POWEROFF_AFTER_REBOOTS);
+                        notify_send_async("看门狗告警", alert);
+
+                        // 强制关机 = 长按电源键 5 秒
+                        gpio_force_poweroff();
+                        gpio_set_led_state(LED_BLINK_FAST);   // 快闪 = 需人工介入
+
+                        // 服务器已断电, 继续监控没有意义: 停止任务,
+                        // 人工开机 (Web"开机"按钮) 时会调用 watchdog_resume() 恢复
+                        s_wd.state = WD_STATE_IDLE;
                         s_wd.running = false;
                         break;
                     }
@@ -249,6 +280,7 @@ esp_err_t watchdog_init(void)
     s_wd.heartbeat_timeout_s = DEFAULT_HEARTBEAT_TIMEOUT;
     s_wd.state = WD_STATE_IDLE;
     s_wd.window_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_wd.auto_poweroff_enabled = true;   // 默认开启, 由 NVS 配置覆盖
     return ESP_OK;
 }
 
@@ -308,6 +340,9 @@ void watchdog_get_stats(watchdog_stats_t *stats)
     stats->response_count  = s_wd.response_count;
     stats->timeout_count   = s_wd.timeout_count;
     stats->consecutive_timeouts = s_wd.consecutive_timeouts;
+    stats->consecutive_reboots  = s_wd.consecutive_reboots;
+    stats->running              = s_wd.running;
+    stats->auto_poweroff_enabled = s_wd.auto_poweroff_enabled;
 }
 
 void watchdog_reset_stats(void)
@@ -371,4 +406,39 @@ void watchdog_get_params(uint32_t *interval_s, uint32_t *timeout_s)
 void watchdog_register_server_down_callback(void (*cb)(void))
 {
     s_wd.server_down_callback = cb;
+}
+
+void watchdog_set_auto_poweroff(bool enabled)
+{
+    s_wd.auto_poweroff_enabled = enabled;
+    ESP_LOGI(TAG, "Auto poweroff after %d consecutive reboots: %s",
+             WD_AUTO_POWEROFF_AFTER_REBOOTS, enabled ? "enabled" : "disabled");
+}
+
+bool watchdog_get_auto_poweroff(void)
+{
+    return s_wd.auto_poweroff_enabled;
+}
+
+esp_err_t watchdog_resume(void)
+{
+    // 人工介入 (Web 点"开机") 后调用: 清零退避与连续重启计数, 重新开始监控
+    s_wd.consecutive_reboots    = 0;
+    s_wd.reboot_count_in_hour   = 0;
+    s_wd.window_start_ms        = (uint32_t)(esp_timer_get_time() / 1000);
+    s_wd.stable_since_ms        = 0;
+    s_wd.consecutive_timeouts   = 0;
+    s_wd.boot_grace_until_ms    = (uint32_t)(esp_timer_get_time() / 1000)
+                                  + (CONFIG_WD_BOOT_GRACE_PERIOD_S * 1000);
+    gpio_set_led_state(LED_OFF);
+
+    if (!s_wd.running) {
+        ESP_LOGW(TAG, "Watchdog was stopped, restarting monitoring");
+        LOG_I("看门狗已恢复监控 (连续重启计数已清零)");
+        return watchdog_start(0, 0);
+    }
+
+    ESP_LOGI(TAG, "Watchdog backoff counters reset");
+    LOG_I("看门狗连续重启计数已清零");
+    return ESP_OK;
 }

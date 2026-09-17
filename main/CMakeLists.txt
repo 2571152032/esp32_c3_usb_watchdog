@@ -19,10 +19,12 @@ idf_component_register(
         dashboard_html.c
         event_log.c
         uptime.c
+        notify.c
     INCLUDE_DIRS
         "."
     REQUIRES
         esp_http_server
+        esp_http_client
         esp_wifi
         nvs_flash
         esp_netif
@@ -32,5 +34,6 @@ idf_component_register(
         app_update
         esp_partition
         esp_app_format
+        mbedtls
         lwip
 )

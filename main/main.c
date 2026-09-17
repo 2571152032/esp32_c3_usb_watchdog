@@ -33,6 +33,7 @@
 #include "event_log.h"
 #include "uptime.h"
 #include "ota_update.h"
+#include "notify.h"
 #include "esp_task_wdt.h"
 
 #define TAG "MAIN"
@@ -74,7 +75,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-// 初始化 WiFi (STA 模式)
+// WiFi 协议栈是否已初始化 (重复调用 esp_wifi_init/esp_netif_create 会失败)
+static bool s_wifi_stack_ready = false;
+
+// 初始化并启动 WiFi (STA 模式) —— 只做一次, 之后重试连接不再重复初始化
 static esp_err_t wifi_init_sta(const char *ssid, const char *password)
 {
     ESP_LOGI(TAG, "Connecting to WiFi: %s", ssid);
@@ -100,18 +104,16 @@ static esp_err_t wifi_init_sta(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // 等待连接结果 (15 秒超时)
+    return ESP_OK;
+}
+
+// 等待 WiFi 连接成功 (断开后由事件回调自动重连, 这里只负责等待)
+static bool wifi_wait_connected(uint32_t timeout_ms)
+{
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
-
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WiFi connected successfully");
-        return ESP_OK;
-    } else {
-        ESP_LOGE(TAG, "WiFi connection failed");
-        return ESP_FAIL;
-    }
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+    return (bits & WIFI_CONNECTED_BIT) != 0;
 }
 
 // 检查是否需要进入配网模式
@@ -124,6 +126,36 @@ static bool should_enter_config_mode(void)
         return true;
     }
     return false;
+}
+
+// 启动服务器监控 (USB 看门狗 + Web 服务器), 幂等: 重复调用只启动一次
+static void start_monitoring(void)
+{
+    static bool wd_started = false;
+    static bool web_started = false;
+
+    if (!wd_started) {
+        // 启动 USB 看门狗
+        if (usb_device_init() == ESP_OK) {
+            ESP_LOGI(TAG, "USB device initialized");
+            watchdog_start(0, 0);
+            ESP_LOGI(TAG, "Watchdog started, monitoring server...");
+            wd_started = true;
+        } else {
+            ESP_LOGE(TAG, "USB device init failed");
+            LOG_E("USB 设备初始化失败");
+        }
+    }
+
+    if (!web_started) {
+        esp_err_t web_ret = web_server_start();
+        if (web_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Web server start returned: %s", esp_err_to_name(web_ret));
+        } else {
+            ESP_LOGI(TAG, "Web server started");
+            web_started = true;
+        }
+    }
 }
 
 // 主任务 - 系统状态机
@@ -145,8 +177,9 @@ static void system_task(void *pvParameter)
                 // 检查复位按钮是否长按 (在启动时检测)
                 if (gpio_is_button_pressed_long()) {
                     ESP_LOGI(TAG, "Long press detected at boot, clearing config");
-                    LOG_W("启动时检测到长按 -> 清除 WiFi 配置");
-                    nvs_clear_wifi_config();
+                    LOG_W("启动时检测到长按 -> 恢复出厂设置并重启");
+                    nvs_factory_reset();
+                    esp_restart();
                 }
 
                 if (should_enter_config_mode()) {
@@ -167,54 +200,46 @@ static void system_task(void *pvParameter)
             }
 
             case SYS_STATE_CONNECTING: {
-                char ssid[64] = {0};
-                char password[64] = {0};
-                nvs_get_wifi_ssid(ssid, sizeof(ssid));
-                nvs_get_wifi_password(password, sizeof(password));
+                if (!s_wifi_stack_ready) {
+                    char ssid[64] = {0};
+                    char password[64] = {0};
+                    nvs_get_wifi_ssid(ssid, sizeof(ssid));
+                    nvs_get_wifi_password(password, sizeof(password));
+                    wifi_init_sta(ssid, password);
+                    s_wifi_stack_ready = true;
+                }
 
-                if (wifi_init_sta(ssid, password) == ESP_OK) {
+                if (wifi_wait_connected(15000)) {
+                    ESP_LOGI(TAG, "WiFi connected successfully");
                     LOG_I("WiFi 已连接, 进入运行状态");
                     // 启动 SNTP 网络时间同步 (北京时间), 日志时间将显示为绝对时间
                     event_log_init_sntp();
                     g_system_state = SYS_STATE_RUNNING;
                 } else {
-                    // 连接失败，清除配置，进入配网模式
-                    ESP_LOGE(TAG, "WiFi connect failed, entering config mode");
-                    LOG_E("WiFi 连接失败 -> 进入配网模式");
-                    nvs_clear_wifi_config();
+                    // 【重要】连接失败不再清除 WiFi 配置、也不再进入配网模式:
+                    //   1) 驱动会在断开事件里自动重连, 这里只需继续等待;
+                    //   2) WiFi 长期不可用时, 服务器看门狗仍需工作 (否则服务器
+                    //      失去保护), 因此在第一轮失败后就地启动 USB 看门狗。
+                    ESP_LOGW(TAG, "WiFi not connected yet, keep retrying...");
+                    LOG_W("WiFi 未连接成功, 保留配置继续重试");
+                    start_monitoring();
 
-                    // 彻底清理 STA 网络栈。否则 smart_config 里再次 esp_wifi_init
-                    // 会因驱动已初始化而返回错误, ESP_ERROR_CHECK 直接 panic 重启。
-                    esp_wifi_stop();
-                    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-                    if (sta) {
-                        esp_netif_destroy(sta);
+                    // 连接不上时, 长按按钮仍可强制恢复出厂设置并进入配网模式 (唯一逃生通道)
+                    if (gpio_is_button_pressed_long()) {
+                        ESP_LOGI(TAG, "Long press detected, factory reset and restarting");
+                        LOG_W("长按按钮 -> 恢复出厂设置并重启进入配网模式");
+                        nvs_factory_reset();
+                        esp_restart();
                     }
-                    esp_wifi_deinit();
 
-                    g_system_state = SYS_STATE_CONFIG_MODE;
+                    vTaskDelay(pdMS_TO_TICKS(5000));
                 }
                 break;
             }
 
             case SYS_STATE_RUNNING: {
                 LOG_I("进入运行状态");
-                // 启动 USB 看门狗
-                if (usb_device_init() == ESP_OK) {
-                    ESP_LOGI(TAG, "USB device initialized");
-                    watchdog_start(0, 0);
-                    ESP_LOGI(TAG, "Watchdog started, monitoring server...");
-                } else {
-                    ESP_LOGE(TAG, "USB device init failed");
-                    LOG_E("USB 设备初始化失败");
-                }
-
-                // 启动 Web 服务器
-                esp_err_t web_ret = web_server_start();
-                if (web_ret != ESP_OK) {
-                    ESP_LOGW(TAG, "Web server start returned: %s", esp_err_to_name(web_ret));
-                }
-                ESP_LOGI(TAG, "Web server started");
+                start_monitoring();
 
                 // 进入正常运行循环
                 while (g_system_state == SYS_STATE_RUNNING) {
@@ -228,8 +253,8 @@ static void system_task(void *pvParameter)
 
                     // 检查复位按钮长按
                     if (gpio_is_button_pressed_long()) {
-                        ESP_LOGI(TAG, "Long press detected, entering config mode");
-                        nvs_clear_wifi_config();
+                        ESP_LOGI(TAG, "Long press detected, factory reset and restarting");
+                        nvs_factory_reset();
                         esp_restart();
                     }
 
@@ -252,12 +277,21 @@ void app_main(void)
     // 初始化 NVS (通过 nvs_storage 模块统一初始化)
     ESP_ERROR_CHECK(nvs_storage_init());
 
-    // 加载保存的看门狗参数
-    uint32_t hb_interval = 10, hb_timeout = 60;
+    // 【顺序很关键】先 watchdog_init() 把内部状态清零并设默认值,
+    // 再加载 NVS 中保存的参数覆盖默认值。顺序颠倒会导致
+    //  watchdog_init() 内部的 memset + 默认值覆盖掉刚加载的用户参数,
+    // 看起来"重启后参数丢失, 永远回到默认 60/600"。
+    watchdog_init();
+
+    // 加载保存的看门狗参数 (无保存时使用 watchdog.c 中的默认值 60/600)
+    uint32_t hb_interval = 60, hb_timeout = 600;
     nvs_load_heartbeat_params(&hb_interval, &hb_timeout);
     watchdog_set_params(hb_interval, hb_timeout);
     ESP_LOGI(TAG, "Loaded watchdog params: interval=%lus, timeout=%lus",
              (unsigned long)hb_interval, (unsigned long)hb_timeout);
+
+    // 初始化通知推送 (URL / 开关来自 NVS)
+    notify_init();
 
     // 初始化网络接口
     ESP_ERROR_CHECK(esp_netif_init());
@@ -295,8 +329,12 @@ void app_main(void)
     ESP_LOGI(TAG, "Task WDT: reusing the one auto-initialized by IDF (30s timeout)");
     LOG_I("任务看门狗已启用 (30 秒超时)");
 
-    // 初始化看门狗 (不启动，等 WiFi 连接后再启动)
-    watchdog_init();
+    // (watchdog_init() 已在上方完成, 不再重复调用)
+
+    // 加载"连续多次重启后强制关机"开关 (默认开启, 可在 Web 端关闭)
+    bool auto_off = true;
+    nvs_load_auto_poweroff(&auto_off);
+    watchdog_set_auto_poweroff(auto_off);
 
     // 创建系统任务
     xTaskCreate(system_task, "system_task", 8192, NULL, 5, NULL);
