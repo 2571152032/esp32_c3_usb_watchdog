@@ -18,6 +18,7 @@ esp32_c3_usb_watchdog/
 ├── CMakeLists.txt           # 项目注册 (PROJECT_VER = 1.2.31)
 ├── partitions.csv           # OTA 双分区表 (4MB Flash 版, 默认)
 ├── sdkconfig.defaults       # 默认配置
+├── server/                  # Linux服务器端心跳回复服务
 ├── README.md
 ├── demo/
 │   └── dashboard_demo.html  # 纯前端演示页 (浏览器直接打开, 无需设备)
