@@ -1,0 +1,18 @@
+[Unit]
+Description=ESP32-C3 USB Watchdog Daemon
+After=network.target
+After=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/usb-watchdog/usb-watchdog.py --device /dev/ttyACM0
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
