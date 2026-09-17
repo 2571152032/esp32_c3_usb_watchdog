@@ -3,7 +3,7 @@
  * @brief 配网实现 (AP 模式 + 手动输入 SSID/密码)
  *
  * 流程：
- *  1. 启动 SoftAP (ESP32-Watchdog / 12345678)
+ *  1. 启动 SoftAP (Watchdog-AP / 12345678)
  *  2. 启动 HTTP 服务器 (端口 80)
  *  3. GET  /connect  -> 返回配网表单 HTML
  *     POST /connect  -> 解析表单 (ssid & password)，保存到 NVS，重启
@@ -33,7 +33,7 @@
 #define TAG "SMART_CFG"
 
 // AP 配置
-#define AP_SSID             "ESP32-Watchdog"
+#define AP_SSID             "Watchdog-AP"
 #define AP_PASSWORD         "12345678"
 #define AP_CHANNEL          1
 #define AP_MAX_CONNECTIONS  4

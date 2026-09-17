@@ -480,7 +480,8 @@ static void poweron_task(void *pv)
     LOG_I("Web 触发服务器开机");
     gpio_trigger_server_poweron(0);
 
-    // 人工开机 = 人工介入: 清零连续重启计数; 若因强制关机/重启过多而停止了监控, 一并恢复
+    // Web 端执行开机控制 = 管理员已修复故障:
+    // 清零连续重启计数; 若看门狗因"强制关机/重启过多"而停止, 一并恢复监控
     watchdog_resume();
     vTaskDelete(NULL);
 }

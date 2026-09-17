@@ -9,6 +9,12 @@
  *  - 指数退避: 重启后等待 30/60/120/240/300s 再继续监控
  *  - 最大重启: 1 小时内超过 CONFIG_WD_MAX_REBOOTS_PER_HOUR 次则停止 (防死循环)
  *  - 开机宽限期: 服务器刚重启的 CONFIG_WD_BOOT_GRACE_PERIOD_S 秒内不计超时
+ *
+ * 通知策略 (v1.3):
+ *  - 每次触发宕机重启 -> 推送一条 "宕机通知"
+ *  - 触发强制关机     -> 推送一条 "强制关机通知"
+ *  - 看门狗停止       -> 推送一条 "看门狗已停止" 通知;
+ *    之后管理员在 Web 端执行 "开机" 操作即视为已修复故障, 自动恢复监控
  */
 
 #include <stdio.h>
@@ -195,11 +201,11 @@ static void watchdog_task(void *pvParameter)
                     if (s_wd.reboot_count_in_hour > CONFIG_WD_MAX_REBOOTS_PER_HOUR) {
                         ESP_LOGE(TAG, "MAX REBOOTS (%d/hour) REACHED - stopping watchdog",
                                  CONFIG_WD_MAX_REBOOTS_PER_HOUR);
-                        LOG_F("看门狗已停止: 1 小时内重启次数过多 (%d 次), 需人工介入",
+                        LOG_F("看门狗已停止: 1 小时内重启次数过多 (%d 次), 需管理员介入",
                               CONFIG_WD_MAX_REBOOTS_PER_HOUR);
                         notify_send_async("看门狗已停止",
-                                          "1 小时内重启次数过多, 已停止自动重启, 需人工介入");
-                        gpio_set_led_state(LED_BLINK_FAST);  // 快闪 = 需人工介入
+                                          "1 小时内重启次数过多, 已停止自动重启, 需管理员介入");
+                        gpio_set_led_state(LED_BLINK_FAST);  // 快闪 = 需管理员介入
                         s_wd.running = false;
                         break;
                     }
@@ -209,24 +215,34 @@ static void watchdog_task(void *pvParameter)
                         s_wd.consecutive_reboots >= WD_AUTO_POWEROFF_AFTER_REBOOTS) {
                         ESP_LOGE(TAG, "Consecutive reboots reached %d - forcing server power off",
                                  WD_AUTO_POWEROFF_AFTER_REBOOTS);
-                        LOG_F("连续 %d 次重启后服务器仍未恢复 -> 触发强制关机 (需人工开机)",
+                        LOG_F("连续 %d 次重启后服务器仍未恢复 -> 触发强制关机 (需管理员开机)",
                               WD_AUTO_POWEROFF_AFTER_REBOOTS);
 
                         char alert[160];
                         snprintf(alert, sizeof(alert),
-                                 "服务器连续 %d 次重启后仍未恢复, 看门狗已执行强制关机, 请人工介入",
+                                 "服务器连续 %d 次重启后仍未恢复, 看门狗已执行强制关机, 请管理员检查后重新开机",
                                  WD_AUTO_POWEROFF_AFTER_REBOOTS);
-                        notify_send_async("看门狗告警", alert);
+                        notify_send_async("强制关机通知", alert);
 
                         // 强制关机 = 长按电源键 5 秒
                         gpio_force_poweroff();
-                        gpio_set_led_state(LED_BLINK_FAST);   // 快闪 = 需人工介入
+                        gpio_set_led_state(LED_BLINK_FAST);   // 快闪 = 需管理员介入
 
                         // 服务器已断电, 继续监控没有意义: 停止任务,
-                        // 人工开机 (Web"开机"按钮) 时会调用 watchdog_resume() 恢复
+                        // 管理员开机 (Web"开机"按钮) 时会调用 watchdog_resume() 恢复
                         s_wd.state = WD_STATE_IDLE;
                         s_wd.running = false;
                         break;
+                    }
+
+                    // 通知策略: 每次触发宕机重启推送一条 "宕机通知"
+                    // (强制关机分支在上方已 break, 走到这里的一定是 GPIO 复位重启)
+                    {
+                        char alert[160];
+                        snprintf(alert, sizeof(alert),
+                                 "心跳超时 %lu 秒无响应, 已触发服务器重启 (连续第 %lu 次)",
+                                 (unsigned long)elapsed_s, (unsigned long)s_wd.consecutive_reboots);
+                        notify_send_async("宕机通知", alert);
                     }
 
                     if (s_wd.server_down_callback) {
@@ -422,7 +438,8 @@ bool watchdog_get_auto_poweroff(void)
 
 esp_err_t watchdog_resume(void)
 {
-    // 人工介入 (Web 点"开机") 后调用: 清零退避与连续重启计数, 重新开始监控
+    // 管理员介入 (Web 点"开机") 后调用: 视为故障已修复,
+    // 清零退避与连续重启计数, 重新开始监控
     s_wd.consecutive_reboots    = 0;
     s_wd.reboot_count_in_hour   = 0;
     s_wd.window_start_ms        = (uint32_t)(esp_timer_get_time() / 1000);
@@ -430,6 +447,11 @@ esp_err_t watchdog_resume(void)
     s_wd.consecutive_timeouts   = 0;
     s_wd.boot_grace_until_ms    = (uint32_t)(esp_timer_get_time() / 1000)
                                   + (CONFIG_WD_BOOT_GRACE_PERIOD_S * 1000);
+    // 停止前可能停留在 SERVER_DOWN, 恢复时复位为正常状态
+    if (s_wd.state == WD_STATE_SERVER_DOWN) {
+        s_wd.state = WD_STATE_HEALTHY;
+        LOG_I("服务器连接已恢复");
+    }
     gpio_set_led_state(LED_OFF);
 
     if (!s_wd.running) {

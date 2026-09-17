@@ -382,7 +382,7 @@ static const char *s_html =
 "function powerOnServer(){if(confirm('向服务器发送开机信号？')){fetch('/api/poweron',{method:'POST'}).then(function(r){return r.json();}).then(function(d){showToast(d.message||'已发送');});}}"
 "function rebootServer(){if(confirm('向服务器发送重启脉冲？')){fetch('/api/reboot',{method:'POST'}).then(function(r){return r.json();}).then(function(d){showToast(d.message||'已发送');});}}"
 "function resetWifi(){"
-"if(confirm('清除 WiFi 配置并恢复默认账号密码？\\n设备将重启进入配网模式。')){"
+"if(confirm('清除所有配置并恢复到出厂设置？\\n设备将重启进入配网模式。')){"
 "fetch('/api/reset_wifi',{method:'POST'}).then(function(r){return r.json();}).then(function(d){showToast(d.message||'正在重置...');});}"
 "}"
 "function powerOffServer(){if(confirm('确定强制关机吗？将长按电源键 5 秒。')){fetch('/api/poweroff',{method:'POST'}).then(function(r){return r.json();}).then(function(d){showToast(d.message||'已发送');});}}"
