@@ -266,7 +266,10 @@ esp_err_t smart_config_start(void)
         // 喂 Task WDT: 配网最长要等 5 分钟, 而 TWDT 超时只有 30s。
         // 若不喂狗, ESP32 会在用户还没填完 WiFi 密码时就 panic 重启。
         // (smart_config_start 由 system_task 调用, 因此这里喂的是 system_task)
-        esp_task_wdt_reset();
+        // 先查当前任务是否已注册: TWDT 不可用时直接 reset 会每秒刷一条错误日志
+        if (esp_task_wdt_status(NULL) == ESP_OK) {
+            esp_task_wdt_reset();
+        }
 
         vTaskDelay(pdMS_TO_TICKS(1000));
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);

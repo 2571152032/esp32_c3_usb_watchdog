@@ -271,7 +271,7 @@ static void system_task(void *pvParameter)
 void app_main(void)
 {
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "  ESP32-C3 USB Watchdog v1.0");
+    ESP_LOGI(TAG, "  ESP32-C3 USB Watchdog v1.3.1");
     ESP_LOGI(TAG, "========================================");
 
     // 初始化 NVS (通过 nvs_storage 模块统一初始化)
@@ -337,7 +337,12 @@ void app_main(void)
     watchdog_set_auto_poweroff(auto_off);
 
     // 创建系统任务
-    xTaskCreate(system_task, "system_task", 8192, NULL, 5, NULL);
+    BaseType_t task_created = xTaskCreate(system_task, "system_task", 8192, NULL, 5, NULL);
+    if (task_created != pdPASS) {
+        // 无日志会变成"整个状态机静默不运行"的疑难杂症, 这里直接报错重启
+        ESP_LOGE(TAG, "Failed to create system_task (out of memory)");
+        esp_restart();
+    }
 
     ESP_LOGI(TAG, "System initialized, entering main loop...");
 }

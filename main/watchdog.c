@@ -5,7 +5,7 @@
  * 策略 (v2):
  *  - 每 heartbeat_interval_s 发送一次 "ZAIMA\n"
  *  - 超过 heartbeat_timeout_s 未收到响应 -> 判定超时
- *  - 连续超时达阈值 -> 判定宕机, 触发 GPIO 复位
+ *  - 连续超时达阈值 (默认 2 次) -> 判定宕机, 触发 GPIO 复位
  *  - 指数退避: 重启后等待 30/60/120/240/300s 再继续监控
  *  - 最大重启: 1 小时内超过 CONFIG_WD_MAX_REBOOTS_PER_HOUR 次则停止 (防死循环)
  *  - 开机宽限期: 服务器刚重启的 CONFIG_WD_BOOT_GRACE_PERIOD_S 秒内不计超时
@@ -35,7 +35,7 @@
 
 #define DEFAULT_HEARTBEAT_INTERVAL  60   // 秒 (每 60 秒发送一次 ZAIMA)
 #define DEFAULT_HEARTBEAT_TIMEOUT   600  // 秒 (10 分钟无响应即判定宕机)
-#define MAX_CONSECUTIVE_TIMEOUTS    1    // 达超时阈值即判定宕机
+#define MAX_CONSECUTIVE_TIMEOUTS    2    // 连续 2 次心跳超时才判定宕机, 避免偶发 USB 丢包误重启
 #define WD_MAX_INTERVAL_S           86400  // 参数上限 (interval*1000 参与 uint32 运算, 需防溢出)
 #define WD_MAX_TIMEOUT_S            86400
 #define STABLE_RESET_MS             (5 * 60 * 1000UL)  // 连续稳定 5 分钟才重置退避计数
@@ -149,11 +149,14 @@ static void watchdog_task(void *pvParameter)
         }
 
         // 开机宽限期: 服务器刚重启, 暂不判定超时
-        if (s_wd.boot_grace_until_ms > 0 && now_ms < s_wd.boot_grace_until_ms) {
+        // (用差值比较, uint32 毫秒计数约 49.7 天回绕时依然正确)
+        int32_t grace_left_ms = (s_wd.boot_grace_until_ms != 0)
+                                ? (int32_t)(s_wd.boot_grace_until_ms - now_ms) : 0;
+        if (grace_left_ms > 0) {
             // 宽限期内持续刷新 last_response, 避免宽限期结束瞬间立即超时
             s_wd.last_response_ms = now_ms;
             s_wd.consecutive_timeouts = 0;
-        } else if (s_wd.boot_grace_until_ms > 0 && now_ms >= s_wd.boot_grace_until_ms) {
+        } else if (s_wd.boot_grace_until_ms != 0) {
             // 宽限期刚结束
             LOG_I("开机宽限期已结束, 恢复正常监控");
             s_wd.boot_grace_until_ms = 0;
@@ -363,12 +366,16 @@ void watchdog_get_stats(watchdog_stats_t *stats)
 
 void watchdog_reset_stats(void)
 {
+    // 时间戳必须刷新为当前时刻而非清 0:
+    // 若清 0, 下一周期 elapsed = now - 0 = 开机秒数, 会立刻误判超时,
+    // 连续两次就触发 GPIO 复位 —— Web 端"清零"按钮会把正常的服务器硬复位。
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_wd.heartbeat_count      = 0;
     s_wd.response_count       = 0;
     s_wd.timeout_count        = 0;
     s_wd.consecutive_timeouts = 0;
-    s_wd.last_heartbeat_ms    = 0;
-    s_wd.last_response_ms     = 0;
+    s_wd.last_heartbeat_ms    = now_ms;
+    s_wd.last_response_ms     = now_ms;
     ESP_LOGI(TAG, "Watchdog stats reset");
     LOG_I("心跳统计已清零");
 }

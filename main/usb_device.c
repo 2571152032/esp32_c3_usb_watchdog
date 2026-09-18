@@ -16,8 +16,12 @@ static usb_disconnect_callback_t s_disconnect_callback = NULL;
 static SemaphoreHandle_t s_tx_mutex = NULL;
 static bool s_driver_installed = false;
 
-#define USB_RX_BUF_SIZE 256
+#define USB_RX_BUF_SIZE   256
+#define USB_LINE_BUF_SIZE 256
+
 static char s_rx_buf[USB_RX_BUF_SIZE];
+static char s_line_buf[USB_LINE_BUF_SIZE];
+static size_t s_line_len = 0;    // 当前 line_buf 中未处理字节数
 
 // 解析并分发一行数据
 static void process_line(char *line)
@@ -59,21 +63,35 @@ static void usb_rx_task(void *arg)
     while (1) {
         len = usb_serial_jtag_read_bytes(s_rx_buf, USB_RX_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
-            s_rx_buf[len] = '\0';
+            // 将新数据追加到行缓冲, 不要直接处理"尾行"——它可能是被截断的不完整行,
+            // 直接当成完整行解析会导致 ZAIMA/HEI-ZAIDE 被误判为 UNKNOWN 而丢失。
+            if ((size_t)len >= USB_LINE_BUF_SIZE - s_line_len) {
+                // 行缓冲溢出, 丢弃旧数据避免死锁
+                ESP_LOGW(TAG, "Line buffer overflow, dropping %d bytes", (int)s_line_len);
+                s_line_len = 0;
+            }
+            if ((size_t)len < USB_LINE_BUF_SIZE - s_line_len) {
+                memcpy(s_line_buf + s_line_len, s_rx_buf, len);
+                s_line_len += len;
+                s_line_buf[s_line_len] = '\0';
+            }
 
-            // 逐行解析
-            char *line = s_rx_buf;
-            for (int i = 0; i < len; i++) {
-                if (s_rx_buf[i] == '\n' || s_rx_buf[i] == '\r') {
-                    s_rx_buf[i] = '\0';
-                    process_line(line);
-                    line = &s_rx_buf[i + 1];
+            // 只在遇到 \n/\r 时才把前面的内容作为完整行处理, 剩余未结束部分留到下一次读取。
+            char *start = s_line_buf;
+            for (size_t i = 0; i < s_line_len; i++) {
+                if (s_line_buf[i] == '\n' || s_line_buf[i] == '\r') {
+                    s_line_buf[i] = '\0';
+                    process_line(start);
+                    start = &s_line_buf[i + 1];
                 }
             }
-            // 尾行无换行符时也要处理, 否则残留数据会被下次读取覆盖丢弃
-            if (line < s_rx_buf + len) {
-                process_line(line);
+
+            size_t remaining = s_line_len - (size_t)(start - s_line_buf);
+            if (remaining > 0 && start != s_line_buf) {
+                memmove(s_line_buf, start, remaining);
             }
+            s_line_len = remaining;
+            s_line_buf[s_line_len] = '\0';
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -87,6 +105,17 @@ esp_err_t usb_device_init(void)
     }
 
     ESP_LOGI(TAG, "Initializing USB CDC-ACM (ESP32-C3 built-in USB)...");
+
+    // TX 互斥锁必须在任何 "installed" 返回路径之前创建:
+    // 驱动被控制台占用走 "already installed" 分支时同样要能安全发送,
+    // 否则 usb_send_string() 里 xSemaphoreTake(NULL) 会直接崩溃。
+    if (!s_tx_mutex) {
+        s_tx_mutex = xSemaphoreCreateMutex();
+        if (!s_tx_mutex) {
+            ESP_LOGE(TAG, "Failed to create TX mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     usb_serial_jtag_driver_config_t cfg = {
         .tx_buffer_size = 256,
@@ -107,12 +136,6 @@ esp_err_t usb_device_init(void)
     }
 
     s_driver_installed = true;
-
-    s_tx_mutex = xSemaphoreCreateMutex();
-    if (!s_tx_mutex) {
-        ESP_LOGE(TAG, "Failed to create TX mutex");
-        return ESP_ERR_NO_MEM;
-    }
 
     BaseType_t task_ret = xTaskCreatePinnedToCore(
         usb_rx_task, "usb_rx", 4096, NULL, 5, &s_usb_rx_task_handle, 0);
@@ -173,10 +196,30 @@ esp_err_t usb_send_string(const char *str)
     if (xSemaphoreTake(s_tx_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
-    int written = usb_serial_jtag_write_bytes(str, strlen(str), pdMS_TO_TICKS(100));
+    size_t total = strlen(str);
+    size_t sent = 0;
+    int zero_rounds = 0;
+    while (sent < total) {
+        int written = usb_serial_jtag_write_bytes(str + sent, total - sent, pdMS_TO_TICKS(100));
+        if (written < 0) {
+            xSemaphoreGive(s_tx_mutex);
+            return ESP_FAIL;
+        }
+        if (written == 0) {
+            // 主机端未取走数据 (服务器已关机 / USB 未插好):
+            // 最多重试约 2 秒后放弃, 避免看门狗任务在此永久阻塞、超时检测失效
+            if (++zero_rounds > 20) {
+                xSemaphoreGive(s_tx_mutex);
+                ESP_LOGW(TAG, "TX stalled (host not reading), drop %u bytes", (unsigned)(total - sent));
+                return ESP_ERR_TIMEOUT;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        zero_rounds = 0;
+        sent += written;
+    }
     xSemaphoreGive(s_tx_mutex);
-
-    if (written < 0) return ESP_FAIL;
     return ESP_OK;
 }
 

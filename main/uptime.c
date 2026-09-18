@@ -20,7 +20,7 @@
 
 static struct {
     bool     initialized;
-    uint32_t boot_time_ms;     // 本次启动时刻 (ms)
+    int64_t  boot_time_us;     // 本次启动时刻 (us, 64 位避免 49.7 天回绕)
     uint32_t total_reboots;    // 累计服务器重启次数 (从 NVS 加载)
 } s_up = {0};
 
@@ -35,7 +35,7 @@ esp_err_t uptime_init(void)
 {
     if (s_up.initialized) return ESP_OK;
 
-    s_up.boot_time_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_up.boot_time_us = esp_timer_get_time();
     s_up.total_reboots = 0;
 
     nvs_ensure();
@@ -52,8 +52,7 @@ esp_err_t uptime_init(void)
 uint32_t uptime_get_seconds(void)
 {
     if (!s_up.initialized) return 0;
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    return (now_ms - s_up.boot_time_ms) / 1000;
+    return (uint32_t)((esp_timer_get_time() - s_up.boot_time_us) / 1000000LL);
 }
 
 const char *uptime_format(char *buf, size_t buf_len)

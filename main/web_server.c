@@ -9,6 +9,8 @@
 #include "esp_random.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
 
 #include "web_server.h"
 #include "watchdog.h"
@@ -98,7 +100,7 @@ static void set_login_cookie(httpd_req_t *req)
         sprintf(&s_session_token[i * 2], "%02x", rnd[i]);
     }
 
-    static char cookie[128];
+    static _Thread_local char cookie[128];   // 每连接独立, 避免并发登录互相覆盖
     snprintf(cookie, sizeof(cookie),
              SESSION_COOKIE "=%s; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax", s_session_token);
     if (httpd_resp_set_hdr(req, "Set-Cookie", cookie) != ESP_OK) {
@@ -121,6 +123,7 @@ static esp_err_t handler_logout(httpd_req_t *req);
 static esp_err_t handler_status(httpd_req_t *req);
 static esp_err_t handler_dashboard(httpd_req_t *req);
 static esp_err_t handler_reboot(httpd_req_t *req);
+static esp_err_t handler_device_reboot(httpd_req_t *req);
 static esp_err_t handler_poweron(httpd_req_t *req);
 static esp_err_t handler_poweroff(httpd_req_t *req);
 static esp_err_t handler_power_state(httpd_req_t *req);
@@ -213,9 +216,21 @@ static esp_err_t handler_login_post(httpd_req_t *req)
 {
     char buf[256];
     int len = req->content_len;
-    if (len > (int)sizeof(buf) - 1) len = (int)sizeof(buf) - 1;
+    if (len > (int)sizeof(buf) - 1) {
+        // 超长请求直接拒绝, 不静默截断 (截断会导致密码比对莫名失败)
+        httpd_resp_set_status(req, "413 Content Too Large");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"请求过长\"}", -1);
+        return ESP_OK;
+    }
     if (len > 0) {
-        int r = httpd_req_recv(req, buf, len);
+        // 循环读取: TCP 分段时单次 recv 可能只返回部分数据
+        int r = 0;
+        while (r < len) {
+            int n = httpd_req_recv(req, buf + r, len - r);
+            if (n <= 0) break;
+            r += n;
+        }
         if (r > 0) {
             buf[r] = '\0';
 
@@ -283,6 +298,21 @@ static esp_err_t handler_status(httpd_req_t *req)
     ota_status_t ota;
     ota_get_status(&ota);
 
+    // IP / WiFi 信号强度 (控制台状态卡显示; 获取失败时显示占位符)
+    char ip_str[16] = "-";
+    int8_t rssi = 0;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif) {
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+            snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
+        }
+    }
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = ap_info.rssi;
+    }
+
     char json[960];
     snprintf(json, sizeof(json),
         "{"
@@ -301,6 +331,8 @@ static esp_err_t handler_status(httpd_req_t *req)
         "\"reboots\":%lu,"
         "\"wallclock_s\":%lu,"
         "\"time_synced\":%s,"
+        "\"ip\":\"%s\","
+        "\"rssi\":%d,"
         "\"ota\":{\"state\":%d,\"progress\":%u,\"received\":%lu,\"total\":%lu}"
         "}",
         (int)stats.state,
@@ -318,6 +350,8 @@ static esp_err_t handler_status(httpd_req_t *req)
         (unsigned long)uptime_get_reboots(),
         (unsigned long)(event_log_time_synced() ? time(NULL) : 0UL),
         event_log_time_synced() ? "true" : "false",
+        ip_str,
+        (int)rssi,
         (int)ota.state,
         (unsigned int)ota.progress,
         (unsigned long)ota.received_bytes,
@@ -471,6 +505,25 @@ static esp_err_t handler_reboot(httpd_req_t *req)
     xTaskCreate(reboot_task, "reboot_task", 2048, NULL, 5, NULL);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"已发送重启脉冲\"}", -1);
+    return ESP_OK;
+}
+
+// 重启看门狗设备本身 (esp_restart), 与 /api/reboot (GPIO 复位"服务器") 语义不同
+static void device_reboot_task(void *pv)
+{
+    ESP_LOGI(TAG, "Web 触发看门狗设备重启");
+    LOG_W("Web 触发看门狗设备重启");
+    vTaskDelay(pdMS_TO_TICKS(500));   // 让 HTTP 响应先发出
+    esp_restart();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t handler_device_reboot(httpd_req_t *req)
+{
+    if (!require_auth(req, true)) return ESP_OK;
+    xTaskCreate(device_reboot_task, "dev_reboot", 2048, NULL, 5, NULL);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"设备重启中\"}", -1);
     return ESP_OK;
 }
 
@@ -658,7 +711,7 @@ static esp_err_t handler_change_password(httpd_req_t *req)
 {
     if (!require_auth(req, true)) return ESP_OK;
 
-    char query[256];
+    char query[512];   // 三个字段 URL 编码后可能超过 256, 过小会导致改密"假成功"
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         char new_user[MAX_USER_LEN] = {0};
         char new_pass[MAX_PASS_LEN] = {0};
@@ -708,7 +761,7 @@ static esp_err_t handler_change_password(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"无变更\"}", -1);
+    httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"请求参数过长或格式错误\"}", -1);
     return ESP_OK;
 }
 
@@ -1033,6 +1086,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/status",           .method = HTTP_GET,  .handler = handler_status },
         { .uri = "/api/logs",             .method = HTTP_GET,  .handler = handler_logs },
         { .uri = "/api/reboot",           .method = HTTP_POST, .handler = handler_reboot },
+        { .uri = "/api/device_reboot",    .method = HTTP_POST, .handler = handler_device_reboot },
         { .uri = "/api/poweron",          .method = HTTP_POST, .handler = handler_poweron },
         { .uri = "/api/poweroff",         .method = HTTP_POST, .handler = handler_poweroff },
         { .uri = "/api/power-state",      .method = HTTP_GET,  .handler = handler_power_state },

@@ -163,9 +163,13 @@ static esp_err_t ota_finalize(void)
     esp_err_t ret = esp_ota_end(s_ota_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(ret));
+        // 句柄必须释放, 否则下次上传 esp_ota_begin 会因旧句柄残留而失败
+        esp_ota_abort(s_ota_handle);
+        s_ota_handle = 0;
         s_state = OTA_STATE_FAILED;
         return ret;
     }
+    s_ota_handle = 0;
 
     ret = esp_ota_set_boot_partition(s_update_partition);
     if (ret != ESP_OK) {

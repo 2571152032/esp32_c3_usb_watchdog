@@ -38,6 +38,7 @@
 typedef struct {
     char title[NOTIFY_TITLE_MAX_LEN];
     char text[NOTIFY_TEXT_MAX_LEN];
+    char url[NOTIFY_URL_MAX_LEN];   // 入队时快照, 避免发送期间配置被改写
 } notify_msg_t;
 
 static struct {
@@ -45,6 +46,9 @@ static struct {
     char url[NOTIFY_URL_MAX_LEN];
     volatile bool sending;   // 有发送任务在运行
 } s_nt = {0};
+
+// 保护 sending 标志的 check-then-set (Web 测试通知与宕机通知可能并发触发)
+static portMUX_TYPE s_nt_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* ==================== 内部工具 ==================== */
 
@@ -105,7 +109,7 @@ static void notify_task(void *pvParameter)
     percent_encode(msg->text,  enc_text,  sizeof(enc_text));
 
     char url[NOTIFY_URL_OUT_MAX_LEN];
-    snprintf(url, sizeof(url), "%s", s_nt.url);
+    snprintf(url, sizeof(url), "%s", msg->url);
 
     bool has_ph = replace_placeholder(url, sizeof(url), "{TITLE}", enc_title);
     has_ph = replace_placeholder(url, sizeof(url), "{MSG}", enc_text) || has_ph;
@@ -191,28 +195,36 @@ esp_err_t notify_set_config(bool enabled, const char *url)
 
 void notify_send_async(const char *title, const char *text)
 {
-    if (!s_nt.enabled) {
-        ESP_LOGI(TAG, "Notification disabled, skip");
-        return;
+    // 原子地完成 "检查 + 占位", 防止并发调用创建两个发送任务
+    bool start = false;
+    taskENTER_CRITICAL(&s_nt_mux);
+    if (s_nt.enabled && s_nt.url[0] != '\0' && !s_nt.sending) {
+        s_nt.sending = true;
+        start = true;
     }
-    if (s_nt.url[0] == '\0') {
-        ESP_LOGW(TAG, "Notification URL is empty, skip");
-        return;
-    }
-    if (s_nt.sending) {
-        ESP_LOGW(TAG, "Previous notification still sending, skip");
+    taskEXIT_CRITICAL(&s_nt_mux);
+
+    if (!start) {
+        if (!s_nt.enabled) {
+            ESP_LOGI(TAG, "Notification disabled, skip");
+        } else if (s_nt.url[0] == '\0') {
+            ESP_LOGW(TAG, "Notification URL is empty, skip");
+        } else {
+            ESP_LOGW(TAG, "Previous notification still sending, skip");
+        }
         return;
     }
 
     notify_msg_t *msg = calloc(1, sizeof(notify_msg_t));
     if (!msg) {
         ESP_LOGE(TAG, "No memory for notification");
+        s_nt.sending = false;
         return;
     }
     snprintf(msg->title, sizeof(msg->title), "%s", title ? title : "");
     snprintf(msg->text,  sizeof(msg->text),  "%s", text  ? text  : "");
+    snprintf(msg->url,   sizeof(msg->url),   "%s", s_nt.url);
 
-    s_nt.sending = true;
     if (xTaskCreate(notify_task, "notify_task", NOTIFY_TASK_STACK, msg, 4, NULL) != pdPASS) {
         s_nt.sending = false;
         free(msg);
