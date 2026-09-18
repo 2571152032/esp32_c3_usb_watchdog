@@ -8,13 +8,24 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 
 #include "gpio_control.h"
+#include "nvs_storage.h"
 
 #define TAG "GPIO"
 
 // 长按检测参数
 #define BUTTON_ACTIVE_LEVEL    0    // 低电平有效 (按钮另一端接 GND)
+#define BUTTON_POLL_MS         20   // 按钮轮询周期 (独立任务)
+#define BUTTON_DEBOUNCE_MS     50   // 消抖: 电平需稳定 50ms 才认定按下/松开
+#define BUTTON_HINT_MS         1000 // 按满 1s 时提示"继续按住"
+
+// 定义在文件后部的内部函数 (供 gpio_control_init 调用)
+static void button_task(void *pvParameter);
+static bool power_detect_probe(void);
+
+#define POWER_DETECT_REPROBE_MS   10000   // 未接线时的重探间隔
 
 static struct {
     bool initialized;
@@ -24,6 +35,10 @@ static struct {
     bool button_was_pressed;
     bool long_press_detected;
 } s_gpio = {0};
+
+// 电源检测线状态 (悬空检测)
+static bool     s_pwr_detect_wired = false;
+static uint32_t s_last_probe_ms    = 0;
 
 esp_err_t gpio_control_init(void)
 {
@@ -87,11 +102,26 @@ esp_err_t gpio_control_init(void)
     };
     ESP_ERROR_CHECK(gpio_config(&pwr_det_cfg));
 
+    // 启动独立按钮任务 (长按恢复出厂), 与系统状态机解耦
+    BaseType_t ret = xTaskCreate(button_task, "btn_task", 2048, NULL, 4, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create button task");
+        return ESP_ERR_NO_MEM;
+    }
+
     s_gpio.initialized = true;
     s_gpio.led_state = LED_OFF;
     s_gpio.long_press_detected = false;
 
-    ESP_LOGI(TAG, "GPIO 初始化完成");
+    // 上电先探测 PWR_LED 检测线是否接入 (未接则不会误报"开机")
+    s_pwr_detect_wired = power_detect_probe();
+    s_last_probe_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    ESP_LOGI(TAG, "GPIO 初始化完成 (按钮任务已启动, 长按 %u ms 恢复出厂)",
+             (unsigned)CONFIG_LONG_PRESS_DURATION);
+    ESP_LOGI(TAG, "PWR_LED 检测 (GPIO%d): %s",
+             CONFIG_POWER_DETECT_GPIO_PIN,
+             s_pwr_detect_wired ? "已接入" : "未接入 (悬空, 状态显示为未知)");
     return ESP_OK;
 }
 
@@ -148,33 +178,67 @@ bool gpio_is_button_pressed(void)
     return (gpio_get_level(CONFIG_BUTTON_GPIO_PIN) == BUTTON_ACTIVE_LEVEL);
 }
 
-bool gpio_is_button_pressed_long(void)
+/* ========== 按钮任务: 独立轮询 + 消抖 + 长按恢复出厂 ==========
+ *
+ * 之前长按检测由 system_task 轮询调用 gpio_is_button_pressed_long():
+ *   - RUNNING 分支: 每 100ms 轮询, 可用;
+ *   - CONNECTING 分支 (WiFi 连不上时): 一轮 = 等待 15s + 延时 5s,
+ *     即 **约 20 秒才轮询一次**, 5 秒的按压几乎不可能被采到 ——
+ *     而这恰恰是最需要"恢复出厂重配 WiFi"的场景, 表现为"长按很难触发"。
+ *
+ * 改为独立任务后与系统状态完全解耦: 任何状态 (BOOT / 配网 / 连接中 / 运行)
+ * 下按住 CONFIG_LONG_PRESS_DURATION 毫秒都会触发, 并带 50ms 消抖,
+ * 避免抖动/接触不良导致计时被反复清零。
+ */
+static void button_task(void *pvParameter)
 {
-    static uint32_t press_start_time = 0;
-    static bool press_detected = false;
+    uint32_t press_start_ms = 0;
+    uint32_t last_change_ms = 0;
+    int      last_level     = -1;
+    bool     pressed        = false;
+    bool     hinted         = false;
 
-    if (gpio_is_button_pressed()) {
-        if (!press_detected) {
-            press_start_time = (uint32_t)(esp_timer_get_time() / 1000);
-            press_detected = true;
+    while (1) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        int level = gpio_get_level(CONFIG_BUTTON_GPIO_PIN);
+
+        if (level != last_level) {
+            // 电平刚变化, 重新计时消抖
+            last_level = level;
+            last_change_ms = now_ms;
+        } else if ((now_ms - last_change_ms) >= BUTTON_DEBOUNCE_MS) {
+            bool active = (level == BUTTON_ACTIVE_LEVEL);
+
+            if (active && !pressed) {
+                // 稳定按下 -> 开始计时
+                pressed = true;
+                press_start_ms = now_ms;
+                hinted = false;
+                ESP_LOGI(TAG, "按钮按下, 持续按住 %u ms 将恢复出厂设置",
+                         (unsigned)CONFIG_LONG_PRESS_DURATION);
+            } else if (active && pressed) {
+                uint32_t held = now_ms - press_start_ms;
+                if (!hinted && held >= BUTTON_HINT_MS) {
+                    hinted = true;
+                    ESP_LOGW(TAG, "继续按住按钮 %u ms 即可恢复出厂设置",
+                             (unsigned)CONFIG_LONG_PRESS_DURATION);
+                }
+                if (held >= CONFIG_LONG_PRESS_DURATION) {
+                    ESP_LOGW(TAG, "长按确认 (%u ms) -> 恢复出厂设置并重启", (unsigned)held);
+                    nvs_factory_reset();
+                    vTaskDelay(pdMS_TO_TICKS(300));   // 留出落盘/日志输出时间
+                    esp_restart();
+                }
+            } else if (!active && pressed) {
+                // 松开
+                pressed = false;
+                ESP_LOGI(TAG, "按钮释放 (未按满 %u ms, 取消)",
+                         (unsigned)CONFIG_LONG_PRESS_DURATION);
+            }
         }
 
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        uint32_t press_duration = now - press_start_time;
-
-        if (press_duration >= CONFIG_LONG_PRESS_DURATION) {
-            // 重置，防止重复触发
-            press_detected = false;
-            press_start_time = 0;
-            ESP_LOGI(TAG, "检测到长按 (%ums)", press_duration);
-            return true;
-        }
-    } else {
-        press_detected = false;
-        press_start_time = 0;
+        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
     }
-
-    return false;
 }
 
 // LED 更新任务 (需要在主循环中定期调用，或单独任务)
@@ -242,6 +306,34 @@ void gpio_force_poweroff(void)
 }
 
 /* ========== 电源状态检测 (PWR_LED) ========== */
+
+// 悬空检测: 分别用内部上拉 / 下拉各采一次。
+// 若电平始终"跟随"内部电阻 (上拉=高、下拉=低), 说明外部没有驱动源, 即检测线没接;
+// 若两次电平相同 (被外部固定驱动), 说明确实接了信号。
+// 背景: GPIO7 默认内部上拉, 没接线时会恒读高电平 -> Web 一直误显示"开机"。
+static bool power_detect_probe(void)
+{
+    gpio_pullup_en(CONFIG_POWER_DETECT_GPIO_PIN);
+    gpio_pulldown_dis(CONFIG_POWER_DETECT_GPIO_PIN);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    int with_pullup = gpio_get_level(CONFIG_POWER_DETECT_GPIO_PIN);
+
+    gpio_pullup_dis(CONFIG_POWER_DETECT_GPIO_PIN);
+    gpio_pulldown_en(CONFIG_POWER_DETECT_GPIO_PIN);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    int with_pulldown = gpio_get_level(CONFIG_POWER_DETECT_GPIO_PIN);
+
+    // 恢复默认: 输入 + 上拉
+    gpio_pulldown_dis(CONFIG_POWER_DETECT_GPIO_PIN);
+    gpio_pullup_en(CONFIG_POWER_DETECT_GPIO_PIN);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    bool wired = (with_pullup == with_pulldown);   // 两次一致 => 被外部驱动
+    ESP_LOGD(TAG, "PWR_LED 悬空检测: pullup=%d, pulldown=%d -> %s",
+             with_pullup, with_pulldown, wired ? "已接线" : "悬空(未接线)");
+    return wired;
+}
+
 esp_err_t gpio_power_detect_init(void)
 {
     // 已在 gpio_control_init 中统一配置为输入+上拉, 这里做合法性检查
@@ -254,9 +346,29 @@ esp_err_t gpio_power_detect_init(void)
     return ESP_OK;
 }
 
+bool gpio_power_detect_available(void)
+{
+    return s_pwr_detect_wired;
+}
+
 power_state_t gpio_get_power_state(void)
 {
-    if (!s_gpio.initialized) return POWER_STATE_OFF;
+    if (!s_gpio.initialized) return POWER_STATE_UNKNOWN;
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    // 未接线时定期重探 (支持"开机后才插上检测线"的场景);
+    // 一旦检测到已接线就不再重探, 避免反复切换上下拉影响外部信号。
+    if (!s_pwr_detect_wired && (now_ms - s_last_probe_ms >= POWER_DETECT_REPROBE_MS)) {
+        s_pwr_detect_wired = power_detect_probe();
+        s_last_probe_ms = now_ms;
+        if (s_pwr_detect_wired) {
+            ESP_LOGI(TAG, "PWR_LED 检测线已接入, 开始电源状态检测");
+        }
+    }
+    if (!s_pwr_detect_wired) {
+        return POWER_STATE_UNKNOWN;   // 悬空: 不猜, 直接报"未知"
+    }
 
     // 读 PWR_LED 引脚电平, 匹配配置的"开机有效电平"
     int level = gpio_get_level(CONFIG_POWER_DETECT_GPIO_PIN);
@@ -266,7 +378,6 @@ power_state_t gpio_get_power_state(void)
     static int      last_raw       = -1;
     static power_state_t cached    = POWER_STATE_OFF;
     static bool      first_read    = true;   // 首次读取立即生效, 无需消抖
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     if (first_read) {
         // 上电首次: 直接返回当前真实电平, 让 Web 页面立即显示正确状态

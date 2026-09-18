@@ -107,13 +107,28 @@ static esp_err_t wifi_init_sta(const char *ssid, const char *password)
     return ESP_OK;
 }
 
-// 等待 WiFi 连接成功 (断开后由事件回调自动重连, 这里只负责等待)
-static bool wifi_wait_connected(uint32_t timeout_ms)
+// 分片等待 WiFi 连接, 每片都喂一次 Task WDT。
+// 背景: 单次 xEventGroupWaitBits 阻塞 15s 期间无法喂狗, CONNECTING 状态下
+//       连续两轮 (15s 等待 + 5s 延时) 就会超过 30s TWDT 阈值并触发 panic 重启。
+//       WiFi 连不上时状态机一直停在该分支, 之前会表现为"反复重启"。
+static bool wifi_wait_connected_feed(uint32_t timeout_ms)
 {
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
-    return (bits & WIFI_CONNECTED_BIT) != 0;
+    uint32_t waited = 0;
+    while (waited < timeout_ms) {
+        uint32_t slice = (timeout_ms - waited > 1000) ? 1000 : (timeout_ms - waited);
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                               WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                               pdFALSE, pdFALSE, pdMS_TO_TICKS(slice));
+        if (s_task_wdt_registered) {
+            esp_task_wdt_reset();
+        }
+        if (bits & WIFI_CONNECTED_BIT) {
+            return true;
+        }
+        waited += slice;
+    }
+    // 超时: 再查一次当前标志 (可能在最后一片刚置位)
+    return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
 }
 
 // 检查是否需要进入配网模式
@@ -174,14 +189,8 @@ static void system_task(void *pvParameter)
     while (1) {
         switch (g_system_state) {
             case SYS_STATE_BOOT: {
-                // 检查复位按钮是否长按 (在启动时检测)
-                if (gpio_is_button_pressed_long()) {
-                    ESP_LOGI(TAG, "Long press detected at boot, clearing config");
-                    LOG_W("启动时检测到长按 -> 恢复出厂设置并重启");
-                    nvs_factory_reset();
-                    esp_restart();
-                }
-
+                // 注: 长按按钮恢复出厂由 gpio_control 的按钮任务统一处理
+                //     (与系统状态无关, 启动/连接中/运行中都能触发)
                 if (should_enter_config_mode()) {
                     g_system_state = SYS_STATE_CONFIG_MODE;
                 } else {
@@ -209,7 +218,9 @@ static void system_task(void *pvParameter)
                     s_wifi_stack_ready = true;
                 }
 
-                if (wifi_wait_connected(15000)) {
+                // 分片等待 + 持续喂狗: 单次阻塞 15s 期间不能喂狗,
+                // 连不上时会连续多轮, 累计超过 30s 就触发 TWDT panic 重启
+                if (wifi_wait_connected_feed(15000)) {
                     ESP_LOGI(TAG, "WiFi connected successfully");
                     LOG_I("WiFi 已连接, 进入运行状态");
                     // 启动 SNTP 网络时间同步 (北京时间), 日志时间将显示为绝对时间
@@ -223,16 +234,20 @@ static void system_task(void *pvParameter)
                     ESP_LOGW(TAG, "WiFi not connected yet, keep retrying...");
                     LOG_W("WiFi 未连接成功, 保留配置继续重试");
                     start_monitoring();
-
-                    // 连接不上时, 长按按钮仍可强制恢复出厂设置并进入配网模式 (唯一逃生通道)
-                    if (gpio_is_button_pressed_long()) {
-                        ESP_LOGI(TAG, "Long press detected, factory reset and restarting");
-                        LOG_W("长按按钮 -> 恢复出厂设置并重启进入配网模式");
-                        nvs_factory_reset();
-                        esp_restart();
+                    if (s_task_wdt_registered) {
+                        esp_task_wdt_reset();   // 启动监控 (USB/Web) 可能耗时, 出来先喂一次
                     }
 
-                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    // 长按按钮恢复出厂由 gpio_control 的按钮任务处理:
+                    // 过去这里每 ~20s 才轮询一次, WiFi 连不上时几乎按不出来。
+
+                    // 5s 延时同样分片喂狗 (与 RUNNING 分支保持一致的喂狗节奏)
+                    for (int i = 0; i < 5; i++) {
+                        if (s_task_wdt_registered) {
+                            esp_task_wdt_reset();
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(1000));
+                    }
                 }
                 break;
             }
@@ -240,6 +255,9 @@ static void system_task(void *pvParameter)
             case SYS_STATE_RUNNING: {
                 LOG_I("进入运行状态");
                 start_monitoring();
+                if (s_task_wdt_registered) {
+                    esp_task_wdt_reset();
+                }
 
                 // 进入正常运行循环
                 while (g_system_state == SYS_STATE_RUNNING) {
@@ -251,19 +269,16 @@ static void system_task(void *pvParameter)
                     // 更新 LED 状态
                     gpio_led_update();
 
-                    // 检查复位按钮长按
-                    if (gpio_is_button_pressed_long()) {
-                        ESP_LOGI(TAG, "Long press detected, factory reset and restarting");
-                        nvs_factory_reset();
-                        esp_restart();
-                    }
-
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
                 break;
             }
         }
 
+        // 每个状态轮次都喂一次, 保证除 RUNNING 内循环外的路径也不会饿死 TWDT
+        if (s_task_wdt_registered) {
+            esp_task_wdt_reset();
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }

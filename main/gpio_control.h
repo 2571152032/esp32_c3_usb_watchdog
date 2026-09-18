@@ -72,6 +72,7 @@ typedef enum {
 typedef enum {
     POWER_STATE_OFF = 0,   // 关机 / 休眠 (PWR_LED 灭)
     POWER_STATE_ON  = 1,   // 开机 (PWR_LED 亮)
+    POWER_STATE_UNKNOWN = 2, // 检测线未接入 (引脚悬空, 无法判定)
 } power_state_t;
 
 /**
@@ -109,6 +110,13 @@ esp_err_t gpio_power_detect_init(void);
 power_state_t gpio_get_power_state(void);
 
 /**
+ * @brief 电源检测线是否已接入 (悬空检测)
+ * @return true 已接入 (引脚被外部电平驱动), false 悬空/未接线
+ * @note  悬空时引脚只受内部上拉影响, 会恒读高电平 —— 若不检测会一直误报"开机"。
+ */
+bool gpio_power_detect_available(void);
+
+/**
  * @brief 设置 LED 状态
  */
 void gpio_set_led_state(led_state_t state);
@@ -120,10 +128,10 @@ void gpio_set_led_state(led_state_t state);
 bool gpio_is_button_pressed(void);
 
 /**
- * @brief 检测按钮是否长按 (>= 5秒)
- * @return true 长按检测到
+ * @note 长按检测已由 gpio_control_init() 启动的独立按钮任务负责:
+ *       任何系统状态下按住 CONFIG_LONG_PRESS_DURATION 毫秒即自动
+ *       恢复出厂设置并重启 (带 50ms 消抖), 无需外部轮询调用。
  */
-bool gpio_is_button_pressed_long(void);
 
 /**
  * @brief LED 状态更新 (在主循环中定期调用)

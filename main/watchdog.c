@@ -63,6 +63,7 @@ static struct {
 
     // === 自动保护 ===
     bool auto_poweroff_enabled;       // 连续多次重启后是否强制关机
+    bool paused;                      // 因"主动软关机"暂停监控 (Web 点开机后自动恢复)
 } s_wd = {0};
 
 // ==================== 趋势环形缓冲 ====================
@@ -319,6 +320,7 @@ esp_err_t watchdog_start(uint32_t heartbeat_interval_ms, uint32_t timeout_ms)
     }
 
     s_wd.running = true;
+    s_wd.paused  = false;   // 只要重新拉起监控, 就不再是"暂停"状态
     BaseType_t ret = xTaskCreatePinnedToCore(
         watchdog_task, "watchdog_task", 4096, NULL, 3, &s_wd.task_handle, 0);
     if (ret != pdPASS) {
@@ -336,6 +338,47 @@ void watchdog_stop(void)
         vTaskDelete(s_wd.task_handle);
         s_wd.task_handle = NULL;
     }
+}
+
+/**
+ * 主动软关机后暂停监控。
+ *
+ * 背景: "关机（脉冲）"是短按电源键让系统正常关机, 但看门狗无法区分
+ *       "主动关机" 与 "宕机" —— 服务器停止回复心跳后会被判定宕机并
+ *       再次触发 GPIO 复位, 把刚关掉的机器又按开机。
+ *
+ * 做法: 与"强制关机/重启过多"的停止不同, 这里置 paused 标记,
+ *       让 Web 端显示为"监控已暂停 (服务器已关机)"而不是红色告警,
+ *       并在下次点"开机"时由 watchdog_resume() 自动恢复。
+ */
+void watchdog_pause(void)
+{
+    if (!s_wd.running) {
+        s_wd.paused = true;
+        return;
+    }
+
+    s_wd.paused = true;
+    s_wd.running = false;   // 任务在下一个检查点自行退出 (心跳/退避循环均会检查)
+    s_wd.state = WD_STATE_IDLE;
+
+    // 等任务自行退出, 避免 vTaskDelete 与任务末尾自删除竞争
+    for (int i = 0; i < 25 && s_wd.task_handle; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (s_wd.task_handle) {
+        vTaskDelete(s_wd.task_handle);
+        s_wd.task_handle = NULL;
+    }
+
+    ESP_LOGW(TAG, "Watchdog paused (graceful shutdown). Will resume on power on.");
+    LOG_W("监控已暂停 (服务器已关机), Web 端执行\"开机\"后自动恢复");
+    gpio_set_led_state(LED_BLINK_SLOW);   // 慢闪 = 已暂停, 与"快闪=需管理员介入"区分
+}
+
+bool watchdog_is_paused(void)
+{
+    return s_wd.paused;
 }
 
 void watchdog_reset_state(void) { watchdog_reset_state_internal(); }
@@ -362,6 +405,7 @@ void watchdog_get_stats(watchdog_stats_t *stats)
     stats->consecutive_reboots  = s_wd.consecutive_reboots;
     stats->running              = s_wd.running;
     stats->auto_poweroff_enabled = s_wd.auto_poweroff_enabled;
+    stats->paused               = s_wd.paused;
 }
 
 void watchdog_reset_stats(void)
@@ -452,6 +496,7 @@ esp_err_t watchdog_resume(void)
     s_wd.window_start_ms        = (uint32_t)(esp_timer_get_time() / 1000);
     s_wd.stable_since_ms        = 0;
     s_wd.consecutive_timeouts   = 0;
+    s_wd.paused                 = false;   // 软关机暂停 -> 开机后恢复监控
     s_wd.boot_grace_until_ms    = (uint32_t)(esp_timer_get_time() / 1000)
                                   + (CONFIG_WD_BOOT_GRACE_PERIOD_S * 1000);
     // 停止前可能停留在 SERVER_DOWN, 恢复时复位为正常状态

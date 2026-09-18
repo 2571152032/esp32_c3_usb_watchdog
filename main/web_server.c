@@ -125,6 +125,7 @@ static esp_err_t handler_dashboard(httpd_req_t *req);
 static esp_err_t handler_reboot(httpd_req_t *req);
 static esp_err_t handler_device_reboot(httpd_req_t *req);
 static esp_err_t handler_poweron(httpd_req_t *req);
+static esp_err_t handler_shutdown(httpd_req_t *req);
 static esp_err_t handler_poweroff(httpd_req_t *req);
 static esp_err_t handler_power_state(httpd_req_t *req);
 static esp_err_t handler_logs(httpd_req_t *req);
@@ -325,6 +326,7 @@ static esp_err_t handler_status(httpd_req_t *req)
         "\"consecutive_timeouts\":%lu,"
         "\"consecutive_reboots\":%lu,"
         "\"watchdog_running\":%s,"
+        "\"paused\":%s,"
         "\"poweroff_enabled\":%s,"
         "\"notify_enabled\":%s,"
         "\"uptime_s\":%lu,"
@@ -344,6 +346,7 @@ static esp_err_t handler_status(httpd_req_t *req)
         (unsigned long)stats.consecutive_timeouts,
         (unsigned long)stats.consecutive_reboots,
         stats.running ? "true" : "false",
+        stats.paused ? "true" : "false",
         stats.auto_poweroff_enabled ? "true" : "false",
         notify_is_enabled() ? "true" : "false",
         (unsigned long)uptime_get_seconds(),
@@ -508,6 +511,29 @@ static esp_err_t handler_reboot(httpd_req_t *req)
     return ESP_OK;
 }
 
+// 软关机: 短按电源键让服务器自行关机, 之后暂停看门狗监控
+// (否则服务器停止回复心跳会被误判宕机, 又被 GPIO 复位按开机)
+static void shutdown_task(void *pv)
+{
+    ESP_LOGI(TAG, "Web 触发服务器软关机 (短按电源键)");
+    LOG_W("Web 触发服务器软关机, 随后暂停看门狗监控");
+    gpio_trigger_server_poweron(CONFIG_POWERON_PULSE_MS);
+
+    // 给系统留出关机时间 (系统正常关机通常需要若干秒), 再暂停监控
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    watchdog_pause();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t handler_shutdown(httpd_req_t *req)
+{
+    if (!require_auth(req, true)) return ESP_OK;
+    xTaskCreate(shutdown_task, "shutdown_task", 2048, NULL, 5, NULL);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"已发送关机脉冲，监控将在 3 秒后暂停\"}", -1);
+    return ESP_OK;
+}
+
 // 重启看门狗设备本身 (esp_restart), 与 /api/reboot (GPIO 复位"服务器") 语义不同
 static void device_reboot_task(void *pv)
 {
@@ -570,12 +596,14 @@ static esp_err_t handler_power_state(httpd_req_t *req)
     if (!require_auth(req, true)) return ESP_OK;
 
     power_state_t st = gpio_get_power_state();
-    const char *str = (st == POWER_STATE_ON) ? "on" : "off";
+    const char *str = (st == POWER_STATE_ON) ? "on"
+                    : (st == POWER_STATE_OFF) ? "off" : "unknown";
 
     char json[256];
     snprintf(json, sizeof(json),
-        "{\"state\":\"%s\",\"gpio\":%d}",
-        str, CONFIG_POWER_DETECT_GPIO_PIN);
+        "{\"state\":\"%s\",\"gpio\":%d,\"wired\":%s}",
+        str, CONFIG_POWER_DETECT_GPIO_PIN,
+        gpio_power_detect_available() ? "true" : "false");
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, strlen(json));
@@ -1088,6 +1116,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/reboot",           .method = HTTP_POST, .handler = handler_reboot },
         { .uri = "/api/device_reboot",    .method = HTTP_POST, .handler = handler_device_reboot },
         { .uri = "/api/poweron",          .method = HTTP_POST, .handler = handler_poweron },
+        { .uri = "/api/shutdown",         .method = HTTP_POST, .handler = handler_shutdown },
         { .uri = "/api/poweroff",         .method = HTTP_POST, .handler = handler_poweroff },
         { .uri = "/api/power-state",      .method = HTTP_GET,  .handler = handler_power_state },
         { .uri = "/api/settings",         .method = HTTP_POST, .handler = handler_settings },

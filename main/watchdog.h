@@ -61,6 +61,7 @@ typedef struct {
     uint32_t consecutive_reboots;   // 连续重启次数 (稳定运行 5 分钟后自动清零)
     bool     running;               // 监控任务是否在运行
     bool     auto_poweroff_enabled; // 连续多次重启后是否强制关机
+    bool     paused;                // 因"主动软关机"暂停监控 (点开机即恢复)
 } watchdog_stats_t;
 
 /**
@@ -80,6 +81,21 @@ esp_err_t watchdog_start(uint32_t heartbeat_interval_ms, uint32_t timeout_ms);
  * @brief 停止看门狗监控
  */
 void watchdog_stop(void);
+
+/**
+ * @brief 暂停监控 (主动软关机后调用)
+ *
+ * 与 watchdog_stop() 的区别: 会置 paused 标记, Web 端显示为
+ * "监控已暂停 (服务器已关机)" 而非红色告警; 点"开机"时由
+ * watchdog_resume() 自动恢复。
+ * 目的: 软关机后服务器不再回复心跳, 若不暂停会被误判宕机并重新开机。
+ */
+void watchdog_pause(void);
+
+/**
+ * @brief 是否处于"软关机暂停"状态
+ */
+bool watchdog_is_paused(void);
 
 /**
  * @brief 重置看门狗运行时状态 (服务器恢复后调用)

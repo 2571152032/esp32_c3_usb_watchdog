@@ -9,13 +9,103 @@ Linux 服务器硬件看门狗：USB CDC-ACM 心跳 + GPIO 硬件控制 + Web �
 - **SmartConfig 配网**：AP 热点 + Web 向导
 - **Web 控制台**（深色玻璃拟态主题）：状态监控、心跳统计、参数设置、凭据管理、**固件 OTA 更新**、实时事件日志
 - **Web 认证**：默认 `admin / admin123`，可修改；重置网络后恢复默认值
+- **事件通知推送**（可选）：HTTP(S) GET Webhook，宕机 / 强制关机 / 看门狗停止时推送
 - **OTA 双分区**（factory + ota_0 + ota_1），支持失败自动回滚
+
+## GPIO 接线与功能（硬件接线必读）
+
+### 引脚总览
+
+| GPIO | 方向 | 宏定义（`main/gpio_control.h`） | 功能 | 电平 / 时序 |
+|---|---|---|---|---|
+| **GPIO4** | 输出 | `CONFIG_RESET_GPIO_PIN` | 服务器**复位（重启）**脉冲 | 默认高有效，判宕后输出 **500 ms** 脉冲 |
+| **GPIO3** | 输出 | `CONFIG_POWERON_GPIO_PIN` | 服务器**开机**（短按）/ **强制关机**（长按，同一引脚靠时长区分） | 默认高有效；开机 **500 ms** 脉冲，强制关机按住 **5 s** |
+| **GPIO7** | 输入（内部上拉） | `CONFIG_POWER_DETECT_GPIO_PIN` | 服务器**电源状态检测**（接 PWR_LED 信号） | 高电平 = 开机；消抖 **50 ms** |
+| **GPIO5** | 输入（内部上拉） | `CONFIG_BUTTON_GPIO_PIN` | **配网 / 恢复出厂按钮** | 低有效（按下接地），长按 **5 s** 恢复出厂设置并重启 |
+| **GPIO6** | 输出 | `CONFIG_LED_GPIO_PIN` | **状态 LED** | 高电平点亮；慢闪 1 Hz / 快闪 5 Hz / OTA 中 200 ms |
+| **GPIO18 / GPIO19** | USB | — | 内置 USB D- / D+（**CDC-ACM 心跳通道**） | 接服务器 USB 口，**不可复用为普通 GPIO** |
+
+> ⚠ ESP32-C3 的 Strapping 引脚是 **GPIO2 / GPIO8 / GPIO9**，上表分配已全部避开；
+> GPIO18/19 是 USB Serial/JTAG 专用。改动引脚时请避开这些。
+
+### 接线说明
+
+**1. GPIO4 → 服务器主板 `RESET`（复位）排针**
+
+- 一端接主板 `RESET SW` 的其中一根针，另一端接主板 `GND`（**必须与 ESP32-C3 共地**）
+- 建议经 **光耦 / NPN 三极管 / 小信号 MOSFET** 驱动（等效“按一下复位键”），避免把主板电平直接引入 MCU
+- 默认高电平有效（`CONFIG_RESET_ACTIVE_LEVEL=1`）；低有效主板改该宏为 `0`
+
+**2. GPIO3 → 服务器主板 `POWER SW`（开机键）排针**
+
+- 接法同上（一端 `PWR SW`，一端 `GND`），与 GPIO4 共用主板 GND
+- **开机**：Web 点「开机（脉冲）」或管理员介入时输出 500 ms 脉冲（模拟短按）
+- **强制关机**：连续多次重启未恢复时自动执行，或手动点「强制关机」——同一引脚保持有效电平 **5 秒**（模拟长按电源键）
+
+**3. GPIO7 → 服务器主板 `PWR_LED`（电源指示灯）**
+
+- 接 PWR_LED 的**正极信号**（部分主板为 `PWR LED +`），并与主板共地；引脚内部已上拉
+- **电平务必 ≤ 3.3 V**：主板 PWR_LED 若是 5 V 电平，必须经过**电阻分压或光耦隔离**后再接入，否则会烧毁 ESP32-C3
+- 默认高电平 = 开机（`CONFIG_POWER_DETECT_ACTIVE_LEVEL=1`）；若主板 PWR_LED 为低有效，改该宏为 `0`
+- Web 控制台「服务器电源状态」每 3 秒刷新，读取的就是这个引脚
+
+**4. GPIO5 → 配网 / 恢复出厂按钮**
+
+- 按钮两端分别接 **GPIO5** 与 **GND**（内部已上拉，低电平有效，无需外接电阻）
+- 长按 **5 秒** → 清空 WiFi / 凭据 / 心跳参数并重启进入配网模式（Web 端「恢复出厂设置」按钮等效）
+- 启动阶段与运行期都会检测，是设备“救砖”的唯一本地通道
+
+**5. GPIO6 → 状态 LED**
+
+- 串联 **330 Ω ~ 1 kΩ** 电阻接 LED 正极到 GPIO6（LED 负极接地）；若 LED 为高亮/大功率，改用三极管驱动
+- 状态含义：常亮 / 慢闪（1 Hz，正常监控）/ **快闪（5 Hz，需管理员介入**——强制关机或 1 小时内重启过多）/ 200 ms 超快闪（OTA 升级中）
+
+**6. USB（GPIO18 / GPIO19）→ 服务器 USB 口**
+
+- 直接用数据线连服务器 USB-A 口，设备枚举为 `/dev/ttyACM*`，用于心跳 `ZAIMA` 收发
+- 与服务器**同一台机器**的 USB 连接是判定存活的依据，插在别的机器上等于一直“宕机”
+
+### 接线示意
+
+```text
+                     服务器主板
+              ┌──── RESET SW ────┐
+              │                  │
+   GPIO4 ─────┘ (光耦/MOSFET)    │      3.3V
+                                 │       │
+              ┌──── POWER SW ────┐      [ ] 上拉(内部)
+   GPIO3 ─────┘ (光耦/MOSFET)    │       │
+                                 │   GPIO7 ──── PWR_LED+ (≤3.3V, 5V 需分压)
+              ┌──── PWR_LED+ ────┘       GPIO5 ──── 按钮 ──── GND
+              │                          GPIO6 ──── LED ──[330Ω]── GND
+             GND ─────────────── 共地 ─────────────── GND
+                                          USB (GPIO18/19) ──── 服务器 USB 口
+```
+
+### 修改引脚
+
+本项目未提供 Kconfig，引脚是 `main/gpio_control.h` 中 `#ifndef` 保护的编译期默认值。
+如需改动，直接修改对应宏（若你自行在 menuconfig 中定义了同名 `CONFIG_*`，以 menuconfig 为准）：
+
+```c
+#define CONFIG_RESET_GPIO_PIN          4   // 复位
+#define CONFIG_POWERON_GPIO_PIN        3   // 开机 / 强制关机
+#define CONFIG_POWER_DETECT_GPIO_PIN   7   // 电源检测 (PWR_LED)
+#define CONFIG_BUTTON_GPIO_PIN         5   // 配网按钮
+#define CONFIG_LED_GPIO_PIN            6   // 状态 LED
+```
+
+配套的时序 / 有效电平同样在该文件调整：`CONFIG_POWERON_PULSE_MS`（开机脉冲）、
+`CONFIG_FORCE_POWEROFF_HOLD_MS`（强制关机长按）、`CONFIG_LONG_PRESS_DURATION`（按钮长按）、
+`CONFIG_*_ACTIVE_LEVEL`（各引脚有效电平）、`CONFIG_POWER_DETECT_DEBOUNCE_MS`（消抖）。
+
+> 接线前请再次确认：**共地、电平 ≤ 3.3 V、不占用 GPIO2/8/9 与 18/19**。
 
 ## 目录结构
 
 ```text
 esp32_c3_usb_watchdog/
-├── CMakeLists.txt           # 项目注册 (PROJECT_VER = 1.2.31)
+├── CMakeLists.txt           # 项目注册 (PROJECT_VER = 1.3.1)
 ├── partitions.csv           # OTA 双分区表 (4MB Flash 版, 默认)
 ├── sdkconfig.defaults       # 默认配置
 ├── server/
@@ -35,8 +125,9 @@ esp32_c3_usb_watchdog/
     ├── ota_update.c/.h      # 固件 OTA 上传 / 校验 / 写入 / 回滚
     ├── smart_config.c/.h    # AP 配网
     ├── wizard_html.c/.h     # 配网向导页面
-    ├── gpio_control.c/.h    # GPIO 控制
+    ├── gpio_control.c/.h    # GPIO 控制 (复位/开机/关机/电源检测/LED/按钮)
     ├── nvs_storage.c/.h     # NVS (WiFi + 凭据 + 心跳参数)
+    ├── notify.c/.h          # 事件通知推送 (HTTP/HTTPS Webhook)
     ├── event_log.c/.h       # 事件日志 (RAM + NVS)
     └── uptime.c/.h          # 运行时间 / 重启计数
 ```
@@ -49,9 +140,9 @@ idf.py build
 idf.py flash monitor
 ```
 
-**版本号**：根 `CMakeLists.txt` 中的 `set(PROJECT_VER "1.2.31")` 控制。发版时改这一处即可，
+**版本号**：根 `CMakeLists.txt` 中的 `set(PROJECT_VER "1.3.1")` 控制。发版时改这一处即可，
 版本号与构建日期会自动写入镜像 `esp_app_desc_t`，Web 控制台页头显示
-`固件版本 · v1.2.31 · 构建日期 Sep 16 2026`，OTA 上传页解析的也是同一字段。
+`版本 v1.3.1 · 编译日期 Sep 18 2026`，OTA 上传页解析的也是同一字段。
 
 > 改过 `sdkconfig.defaults` 或 `partitions.csv` 后，建议 `idf.py fullclean` 再 `build`，
 > 否则 CMake 可能沿用旧缓存导致新配置不生效。
