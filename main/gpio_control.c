@@ -25,7 +25,8 @@
 static void button_task(void *pvParameter);
 static bool power_detect_probe(void);
 
-#define POWER_DETECT_REPROBE_MS   10000   // 未接线时的重探间隔
+#define POWER_DETECT_REPROBE_MS   10000   // 接线状态重探间隔 (接线/断线都会重探)
+#define POWER_DETECT_CONFIRM_CNT  2       // 连续 N 次探测结果一致才认定接线状态变化
 
 static struct {
     bool initialized;
@@ -39,6 +40,7 @@ static struct {
 // 电源检测线状态 (悬空检测)
 static bool     s_pwr_detect_wired = false;
 static uint32_t s_last_probe_ms    = 0;
+static int      s_probe_votes      = 0;   // 连续"与当前状态相反"的探测次数
 
 esp_err_t gpio_control_init(void)
 {
@@ -311,6 +313,13 @@ void gpio_force_poweroff(void)
 // 若电平始终"跟随"内部电阻 (上拉=高、下拉=低), 说明外部没有驱动源, 即检测线没接;
 // 若两次电平相同 (被外部固定驱动), 说明确实接了信号。
 // 背景: GPIO7 默认内部上拉, 没接线时会恒读高电平 -> Web 一直误显示"开机"。
+//
+// 注意: 探测会短暂 (10ms) 接内部下拉。若 PWR_LED 信号源阻抗很高 ( > ~50kΩ,
+// 例如只经大电阻分压或直接接 LED 阴极), 下拉期间电平可能被拉低而被误判为
+// "未接入"。建议检测线用光耦隔离或低阻分压 (总阻 ≤ 10kΩ) 后再接入。
+//
+// 该函数会被周期性调用 (每 POWER_DETECT_REPROBE_MS), 以便在运行中发现
+// 检测线被拔掉 / 重新插上。
 static bool power_detect_probe(void)
 {
     gpio_pullup_en(CONFIG_POWER_DETECT_GPIO_PIN);
@@ -357,13 +366,34 @@ power_state_t gpio_get_power_state(void)
 
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-    // 未接线时定期重探 (支持"开机后才插上检测线"的场景);
-    // 一旦检测到已接线就不再重探, 避免反复切换上下拉影响外部信号。
-    if (!s_pwr_detect_wired && (now_ms - s_last_probe_ms >= POWER_DETECT_REPROBE_MS)) {
-        s_pwr_detect_wired = power_detect_probe();
+    // 简单消抖: 状态变化后需稳定 DEBOUNCE_MS 才切换
+    static uint32_t last_change_ms = 0;
+    static int      last_raw       = -1;
+    static power_state_t cached    = POWER_STATE_OFF;
+    static bool      first_read    = true;   // 首次读取立即生效, 无需消抖
+
+    // 定期重探接线状态 (无论当前是否接线):
+    //  - 支持"开机后才插上检测线";
+    //  - 也支持"运行中检测线被拔掉"——拔掉后引脚悬空、内部上拉恒读高电平,
+    //    若不重探就会一直误显示"开机" (这正是之前只在启动时检测有效的 bug)。
+    // 只在电平稳定 (超过消抖窗口) 时重探, 避免状态翻转期间误判。
+    if ((now_ms - s_last_probe_ms >= POWER_DETECT_REPROBE_MS) &&
+        (now_ms - last_change_ms >= CONFIG_POWER_DETECT_DEBOUNCE_MS)) {
         s_last_probe_ms = now_ms;
-        if (s_pwr_detect_wired) {
-            ESP_LOGI(TAG, "PWR_LED 检测线已接入, 开始电源状态检测");
+        bool wired = power_detect_probe();
+
+        if (wired == s_pwr_detect_wired) {
+            s_probe_votes = 0;      // 与当前状态一致, 清票
+        } else if (++s_probe_votes >= POWER_DETECT_CONFIRM_CNT) {
+            // 连续 N 次探测结果一致才切换, 抗偶发干扰
+            s_pwr_detect_wired = wired;
+            s_probe_votes = 0;
+            first_read = true;      // 接线状态变了, 下次读取立即生效 (跳过消抖)
+            if (wired) {
+                ESP_LOGI(TAG, "PWR_LED 检测线已接入, 开始电源状态检测");
+            } else {
+                ESP_LOGW(TAG, "PWR_LED 检测线已断开 (引脚悬空), 电源状态显示为未知");
+            }
         }
     }
     if (!s_pwr_detect_wired) {
@@ -372,12 +402,6 @@ power_state_t gpio_get_power_state(void)
 
     // 读 PWR_LED 引脚电平, 匹配配置的"开机有效电平"
     int level = gpio_get_level(CONFIG_POWER_DETECT_GPIO_PIN);
-
-    // 简单消抖: 状态变化后需稳定 DEBOUNCE_MS 才切换
-    static uint32_t last_change_ms = 0;
-    static int      last_raw       = -1;
-    static power_state_t cached    = POWER_STATE_OFF;
-    static bool      first_read    = true;   // 首次读取立即生效, 无需消抖
 
     if (first_read) {
         // 上电首次: 直接返回当前真实电平, 让 Web 页面立即显示正确状态

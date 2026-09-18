@@ -105,7 +105,7 @@ Linux 服务器硬件看门狗：USB CDC-ACM 心跳 + GPIO 硬件控制 + Web �
 
 ```text
 esp32_c3_usb_watchdog/
-├── CMakeLists.txt           # 项目注册 (PROJECT_VER = 1.3.1)
+├── CMakeLists.txt           # 项目注册 (PROJECT_VER = 1.3.2)
 ├── partitions.csv           # OTA 双分区表 (4MB Flash 版, 默认)
 ├── sdkconfig.defaults       # 默认配置
 ├── server/
@@ -140,9 +140,9 @@ idf.py build
 idf.py flash monitor
 ```
 
-**版本号**：根 `CMakeLists.txt` 中的 `set(PROJECT_VER "1.3.1")` 控制。发版时改这一处即可，
+**版本号**：根 `CMakeLists.txt` 中的 `set(PROJECT_VER "1.3.2")` 控制。发版时改这一处即可，
 版本号与构建日期会自动写入镜像 `esp_app_desc_t`，Web 控制台页头显示
-`版本 v1.3.1 · 编译日期 Sep 18 2026`，OTA 上传页解析的也是同一字段。
+`版本 v1.3.2 · 编译日期 Sep 18 2026`，OTA 上传页解析的也是同一字段。
 
 > 改过 `sdkconfig.defaults` 或 `partitions.csv` 后，建议 `idf.py fullclean` 再 `build`，
 > 否则 CMake 可能沿用旧缓存导致新配置不生效。
