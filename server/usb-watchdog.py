@@ -20,6 +20,7 @@ class USBWatchdogDaemon:
         self.running = True
         self.ser = None                    # 串口对象作为实例变量
         self.last_heartbeat = 0.0          # 仅用于日志记录，不做超时判断
+        self._pending_line = b""           # 行缓冲: 解决 readline 超时读到被截断的半行问题
 
         logging.basicConfig(
             level=logging.DEBUG if verbose else logging.INFO,
@@ -28,15 +29,27 @@ class USBWatchdogDaemon:
         self.logger = logging.getLogger("watchdog")
 
     def send_line(self, line):
-        """发送一行文本（自动补 \n），内置串口状态检查"""
+        """发送一行文本（自动补 \n），内置串口状态检查与部分写重试"""
         if not self.ser or not self.ser.is_open:
             self.logger.warning("Cannot send: serial not open")
             return
-            
+
         if not line.endswith("\n"):
             line += "\n"
-            
-        self.ser.write(line.encode("utf-8"))
+
+        data = line.encode("utf-8")
+        written = 0
+        while written < len(data):
+            try:
+                n = self.ser.write(data[written:])
+            except Exception as e:
+                self.logger.warning(f"Serial write failed: {e}")
+                return
+            if n is None or n < 0:
+                self.logger.warning("Serial write returned error")
+                return
+            written += n
+
         self.ser.flush()
         self.logger.debug(f"Sent: {line.strip()}")
 
@@ -52,6 +65,7 @@ class USBWatchdogDaemon:
                     timeout=0.5,          # 调小 timeout，退出时响应更灵敏
                 )
                 self.ser.reset_input_buffer()
+                self._pending_line = b""   # 重连后清空旧缓冲，避免处理上一个会话残留
                 self.logger.info(f"Connected to {self.device}")
                 return self.ser
             except Exception as e:
@@ -95,15 +109,31 @@ class USBWatchdogDaemon:
                 try:
                     raw = self.ser.readline()
                     if raw:
-                        try:
-                            line = raw.decode("utf-8", errors="replace").strip()
-                        except Exception:
-                            line = ""
-                        if line:
-                            self.handle_line(line)
+                        # readline() 在超时前可能只读到被截断的半行(尤其是高丢包时),
+                        # 用 pending_line 累积, 遇到 \n/\r 才作为完整行处理。
+                        self._pending_line += raw
+                        while b'\n' in self._pending_line or b'\r' in self._pending_line:
+                            nl = self._pending_line.find(b'\n')
+                            cr = self._pending_line.find(b'\r')
+                            if cr == -1 or (nl != -1 and nl < cr):
+                                idx = nl
+                                delim_len = 1
+                            else:
+                                idx = cr
+                                delim_len = 1
+                            line = self._pending_line[:idx]
+                            self._pending_line = self._pending_line[idx + delim_len:]
+                            if line:
+                                try:
+                                    text = line.decode("utf-8", errors="replace").strip()
+                                except Exception:
+                                    text = ""
+                                if text:
+                                    self.handle_line(text)
 
                 except serial.SerialException as e:
                     self.logger.error(f"Serial error: {e}, reconnecting...")
+                    self._pending_line = b""
                     try:
                         self.ser.close()
                     except Exception:
