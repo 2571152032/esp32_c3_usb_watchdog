@@ -12,6 +12,7 @@ idf_component_register(
         watchdog.c
         web_server.c
         smart_config.c
+        captive_portal.c
         wizard_html.c
         gpio_control.c
         nvs_storage.c

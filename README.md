@@ -6,7 +6,7 @@ Linux 服务器硬件看门狗：USB CDC-ACM 心跳 + GPIO 硬件控制 + Web �
 
 - **USB CDC-ACM 心跳**：默认每 60 秒发一次 `ZAIMA`，10 分钟（600s）无响应触发 GPIO 复位
 - **GPIO 控制**：服务器复位 / 开机 / 强制关机 / 电源状态检测（PWR_LED）/ LED / 配网按钮
-- **SmartConfig 配网**：AP 热点 + Web 向导
+- **配网（强制门户 Captive Portal）**：AP 热点 + DNS 劫持，连上热点自动弹出配网页 + WiFi 扫描选择
 - **Web 控制台**（深色玻璃拟态主题）：状态监控、心跳统计、参数设置、凭据管理、**固件 OTA 更新**、实时事件日志
 - **Web 认证**：默认 `admin / admin123`，可修改；重置网络后恢复默认值
 - **事件通知推送**（可选）：HTTP(S) GET Webhook，宕机 / 强制关机 / 看门狗停止时推送
@@ -123,7 +123,8 @@ esp32_c3_usb_watchdog/
     ├── web_server.c/.h      # Web 控制台 + 认证 + OTA 路由
     ├── dashboard_html.c/.h  # 控制台 UI 模板
     ├── ota_update.c/.h      # 固件 OTA 上传 / 校验 / 写入 / 回滚
-    ├── smart_config.c/.h    # AP 配网
+    ├── smart_config.c/.h    # AP 配网 + 强制门户探测路由
+    ├── captive_portal.c/.h  # 强制门户 DNS 劫持 (UDP 53)
     ├── wizard_html.c/.h     # 配网向导页面
     ├── gpio_control.c/.h    # GPIO 控制 (复位/开机/关机/电源检测/LED/按钮)
     ├── nvs_storage.c/.h     # NVS (WiFi + 凭据 + 心跳参数)
@@ -179,10 +180,53 @@ idf.py flash monitor
 如确需防降级：设为 `=y`，并在每次发版时递增
 `CONFIG_BOOTLOADER_APP_SECURE_VERSION`。
 
+## 配网（强制门户，自动弹出）
+
+1. 上电，首次启动进入 AP 配网模式：热点 `Watchdog-AP` / 密码 `12345678`（`main/smart_config.c`）
+2. 手机 / 电脑连上该热点后**会自动弹出配网页面**（Android 通知、iOS/macOS CNA 窗口、Windows 浏览器）
+3. 页面会自动扫描附近 WiFi，点一下即可填入 SSID，**也可手动输入**
+4. 保存后设备重启并连接该 WiFi，访问其 IP 进入控制台（默认账号 `admin / admin123`）
+
+> 若系统没有自动弹出（部分定制 ROM / 关闭了强制门户检测），
+> 手动打开 `http://192.168.4.1` 即可，功能完全一致。
+
+### 实现要点
+
+| 组件 | 作用 |
+|---|---|
+| `captive_portal.c` | UDP 53 迷你 DNS 服务器：**所有**域名的 A 记录都回答 AP 自身 IP；AAAA 查询回 `NOERROR` + 空回答（让客户端回落到 IPv4） |
+| `smart_config.c` | 注册各系统探测 URL：`/generate_204*`（Android）返回 302，`/hotspot-detect*`（Apple）返回 200 + 页面，`/ncsi.txt*`（Windows）等；末尾注册通配 `*` 兜底重定向 |
+| `wizard_html.c` | 配网页：`GET /api/scan` 拉附近 WiFi 列表，点击填入，失败自动回退手动输入 |
+
+**为什么 Android 用 302 而不是 204**：`generate_204` 期待 204 表示"有网"。
+回 302 才会让系统判定为"需要登录的网络"并弹出通知 —— 这正是我们要的。
+
+**为什么 Apple 要回页面而不是 302**：iOS 的 CNA 小窗口对 302 处理不稳定，
+直接给它 200 + HTML 最可靠（它靠响应体里有没有 `Success` 字样判断是否能上网）。
+
+注意事项（这几条都是实机踩出来的，改代码前务必看）：
+
+- **必须设 `config.uri_match_fn = httpd_uri_match_wildcard`**
+  IDF v6.1 的 `HTTPD_DEFAULT_CONFIG()` 里这一项是 `NULL`，走精确字符串比较，
+  `'*'` 只是普通字符，所有通配路由静默失效。失效时的现象是日志刷
+  `httpd_uri: URI '/generate_204_xxx' not found` + 404，手机一直不弹配网页
+- **探测路径必须带 `*` 前缀通配**
+  实测 Android 请求的是 `/generate_204_15267541384063288033`（随机数字后缀）
+  和 `/generate_204_<uuid>`，只注册 `/generate_204` 精确匹配抓不到
+- **通配 `*` 必须最后注册**
+  `httpd_find_uri_handler()` 按**注册顺序**返回第一个匹配（不是"最长匹配"），
+  而且注册过 `*` 之后就再也注册不了新 handler（内部查重时 `*` 匹配一切，
+  直接返回 `ESP_ERR_HTTPD_HANDLER_EXISTS`）
+- **配网期 WiFi 必须是 `WIFI_MODE_APSTA`，不能用 `WIFI_MODE_AP`**
+  纯 AP 模式下 `esp_wifi_scan_start()` 直接返回 `ESP_FAIL`，"扫描附近 WiFi"
+  功能不可用。STA 接口只用于扫描，不配 SSID 也不联网
+- 重定向 `Location` 必须是**绝对地址**（`http://192.168.4.1/`）。相对路径会被
+  Android 拼到 `connectivitycheck.gstatic.com` 上，导致打不开
+
 ## Web 使用
 
-1. 上电，首次进入 AP 配网模式：热点 `ESP32-Watchdog` / 密码 `12345678`
-2. 浏览器打开 `http://192.168.4.1`，填写 WiFi
+1. 上电，首次进入 AP 配网模式：热点 `Watchdog-AP` / 密码 `12345678`
+2. 连上热点后自动弹出配网页（或手动打开 `http://192.168.4.1`），填写 WiFi
 3. 设备重启联网后，访问其 IP 进入控制台（默认账号 `admin / admin123`）
 
 ### 界面概览
