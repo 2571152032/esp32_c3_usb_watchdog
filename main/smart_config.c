@@ -29,6 +29,7 @@
 #include "smart_config.h"
 #include "nvs_storage.h"
 #include "wizard.html.h"
+#include "captive_dns.h"
 
 #define TAG "SMART_CFG"
 
@@ -41,6 +42,10 @@
 
 static httpd_handle_t s_server = NULL;
 static smart_config_state_t s_state = SC_STATE_IDLE;
+
+// 强制门户地址: 连上热点后系统/浏览器要跳转到的配网页面。
+// 必须是长期有效的静态存储 —— DHCP 服务器只保存这个指针 (见 esp_netif 实现)。
+static char s_captive_uri[48] = "http://192.168.4.1/";
 
 static void set_state(smart_config_state_t state)
 {
@@ -144,6 +149,21 @@ static esp_err_t handler_post_connect(httpd_req_t *req)
     return ESP_OK;
 }
 
+// 强制门户: 所有未注册的 URL (含各系统的联网探测地址) 一律 302 到配网页面。
+// 没有它, 手机/电脑连上热点后只会显示"无法访问互联网", 不会自动弹配网页。
+static esp_err_t captive_redirect_handler(httpd_req_t *req, httpd_err_code_t err)
+{
+    if (err == HTTPD_404_NOT_FOUND) {
+        ESP_LOGD(TAG, "Captive redirect: %s -> %s", req->uri, s_captive_uri);
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", s_captive_uri);
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+    // 其它错误走默认处理
+    return httpd_resp_send_err(req, err, NULL);
+}
+
 // 处理 favicon.ico (避免 404 刷屏)
 static esp_err_t handler_favicon(httpd_req_t *req)
 {
@@ -195,8 +215,62 @@ static esp_err_t start_web_server(void)
     httpd_register_uri_handler(s_server, &uri_connect_post);
     httpd_register_uri_handler(s_server, &uri_favicon);
 
+    // 404 兜底重定向 -> 强制门户
+    if (httpd_register_err_handler(s_server, HTTPD_404_NOT_FOUND, captive_redirect_handler) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to register 404 redirect handler");
+    }
+
     ESP_LOGI(TAG, "Web server started on port 80");
     return ESP_OK;
+}
+
+/**
+ * 让连上热点的设备"自动进入配网页面", 三件事:
+ *  1) DHCP 下发 DNS 服务器 = 本机       -> 客户端所有域名解析都发给我们
+ *  2) captive_dns 把所有 A 查询回答本机  -> 任意网址都解析到配网页
+ *  3) DHCP 下发 RFC 8910 强制门户 URI   -> 支持的系统(Android 11+/iOS/Win11)
+ *                                          连上 WiFi 直接弹出配网页面, 不用手输地址
+ */
+static void captive_portal_setup(void)
+{
+    esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap_netif) {
+        ESP_LOGW(TAG, "AP netif not found, skip captive portal setup");
+        return;
+    }
+
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(ap_netif, &ip_info) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to get AP IP, skip captive portal setup");
+        return;
+    }
+
+    snprintf(s_captive_uri, sizeof(s_captive_uri), "http://" IPSTR "/", IP2STR(&ip_info.ip));
+
+    // 停 -> 改 -> 启
+    esp_netif_dhcps_stop(ap_netif);
+
+    // 1) 下发 DNS 服务器选项 (值为 1 表示"下发 DNS", 地址默认就是 AP 自己)
+    uint8_t offer_dns = 1;
+    if (esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER,
+                               &offer_dns, sizeof(offer_dns)) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set DHCP DNS option");
+    }
+
+    // 3) RFC 8910 Captive Portal Identification
+    if (esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET, ESP_NETIF_CAPTIVEPORTAL_URI,
+                               (void *)s_captive_uri, strlen(s_captive_uri)) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set DHCP captive portal URI");
+    }
+
+    esp_netif_dhcps_start(ap_netif);
+
+    // 2) DNS 劫持
+    if (captive_dns_start(ip_info.ip.addr) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start captive DNS server");
+    } else {
+        ESP_LOGI(TAG, "Captive portal ready: %s", s_captive_uri);
+    }
 }
 
 // 启动 AP 模式
@@ -258,6 +332,9 @@ esp_err_t smart_config_start(void)
         return ret;
     }
 
+    // 强制门户: DNS 劫持 + DHCP 下发门户地址, 连上热点自动弹配网页面
+    captive_portal_setup();
+
     // 等待配网完成 (在 handler_post_connect 中 esp_restart)
     ESP_LOGI(TAG, "Waiting for configuration... (timeout 5min)");
 
@@ -285,6 +362,7 @@ esp_err_t smart_config_start(void)
 
 void smart_config_stop(void)
 {
+    captive_dns_stop();
     if (s_server) {
         httpd_stop(s_server);
         s_server = NULL;

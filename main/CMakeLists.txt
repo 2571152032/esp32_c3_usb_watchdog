@@ -14,6 +14,7 @@ idf_component_register(
         smart_config.c
         wizard_html.c
         gpio_control.c
+        captive_dns.c
         nvs_storage.c
         ota_update.c
         dashboard_html.c
