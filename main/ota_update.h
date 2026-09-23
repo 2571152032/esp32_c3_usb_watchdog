@@ -17,6 +17,54 @@ extern "C" {
 
 #define OTA_RECV_BUF_SIZE  1024   // 单次接收缓冲 (字节)
 
+// ==================== 在线检查新固件 ====================
+//
+// 【要改地址就改下面这一行 OTA_CHECK_URL 的值】
+//
+// 设备对 OTA_CHECK_URL 发一个 GET，按返回内容判断是否已有新版本。
+// 服务端返回内容支持两种写法（自动识别，不用额外配置）:
+//
+//   1) JSON（推荐）:
+//        {"version":"1.3.3","url":"https://你的域名/esp32c3_watchdog.bin"}
+//      - version: 最新版本号 (必填)，与镜像里的 PROJECT_VER 比较
+//      - url    : 固件下载地址 (可省略；省略时 Web 端只提示版本，不给下载链接)
+//      例: {"version":"1.3.3","url":"https://example.com/fw/esp32_c3_usb_watchdog.bin"}
+//
+//   2) 纯文本: 直接返回版本号即可，例如文件里就一行  1.3.3
+//
+// 留空字符串 "" 表示禁用在线检查（Web 端会提示"未配置在线检查地址"）。
+#ifndef OTA_CHECK_URL
+#define OTA_CHECK_URL  ""
+#endif
+
+// 在线检查状态
+typedef enum {
+    OTA_CHECK_IDLE = 0,   // 未检查过
+    OTA_CHECK_RUNNING,    // 正在检查
+    OTA_CHECK_OK,         // 检查完成
+    OTA_CHECK_FAILED,     // 检查失败
+} ota_check_state_t;
+
+// 在线检查结果
+typedef struct {
+    ota_check_state_t state;
+    bool  has_update;
+    char  latest_version[32];   // 线上最新版本号
+    char  url[192];             // 线上固件下载地址 (可能为空)
+    char  message[96];          // 可直接展示给用户的中文提示
+} ota_check_info_t;
+
+/**
+ * @brief 获取最近一次在线检查的结果 (供 Web 端展示)
+ */
+void ota_check_get_info(ota_check_info_t *info);
+
+/**
+ * @brief 发起一次在线检查 (内部创建临时任务, 不阻塞调用者)
+ * @return ESP_OK 已开始; 其它: 未配置地址 / 正在检查 / 内存不足
+ */
+esp_err_t ota_check_start(void);
+
 // OTA 状态
 typedef enum {
     OTA_STATE_IDLE = 0,       // 空闲

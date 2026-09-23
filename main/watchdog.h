@@ -43,8 +43,11 @@ uint32_t watchdog_get_trend_count(void);
 #define CONFIG_WD_BOOT_GRACE_PERIOD_S   180  // 服务器开机后宽限期 (秒, 期间不计超时)
 #endif
 #ifndef WD_AUTO_POWEROFF_AFTER_REBOOTS
-#define WD_AUTO_POWEROFF_AFTER_REBOOTS  3    // 连续重启达到该次数后触发强制关机
+#define WD_AUTO_POWEROFF_AFTER_REBOOTS  3    // 默认: 连续重启达到该次数后触发强制关机
 #endif
+// "连续多少次重启后强制关机" 的允许范围 (可在 Web 端自定义)
+#define WD_AUTO_POWEROFF_MIN_REBOOTS    1
+#define WD_AUTO_POWEROFF_MAX_REBOOTS    20
 
 // 指数退避: 重启后等待时间 (秒): 30/60/120/240/300
 uint32_t watchdog_get_retry_delay(void);
@@ -156,6 +159,17 @@ void watchdog_set_auto_poweroff(bool enabled);
  * @brief 查询 "连续多次重启后强制关机" 是否启用
  */
 bool watchdog_get_auto_poweroff(void);
+
+/**
+ * @brief 设置 "连续 N 次重启未恢复 -> 自动强制关机" 的次数阈值
+ * @param count 次数, 超出 [WD_AUTO_POWEROFF_MIN_REBOOTS, WD_AUTO_POWEROFF_MAX_REBOOTS] 会被钳制
+ */
+void watchdog_set_auto_poweroff_count(uint32_t count);
+
+/**
+ * @brief 获取当前 "连续 N 次重启 -> 强制关机" 的次数阈值
+ */
+uint32_t watchdog_get_auto_poweroff_count(void);
 
 /**
  * @brief 恢复监控 (强制关机后由人工开机时调用)

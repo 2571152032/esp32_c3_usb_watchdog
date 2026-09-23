@@ -33,6 +33,10 @@
 
 #include "ota_update.h"
 #include "nvs_storage.h"
+#include "event_log.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "esp_app_format.h"
 
 static const char *TAG = "OTA";
 
@@ -361,5 +365,189 @@ esp_err_t ota_update_init(void)
     s_received_bytes = 0;
     s_total_bytes = 0;
     s_reboot_pending = false;
+    return ESP_OK;
+}
+
+/* ==================== 在线检查新固件 ====================
+ *
+ * GET OTA_CHECK_URL -> 取回版本号 (JSON 或纯文本) -> 与当前镜像版本比较。
+ * 只做"检查", 不下载、不刷写; 检查在独立任务里完成, 不阻塞 Web 请求。
+ */
+
+#define OTA_CHECK_TIMEOUT_MS   10000
+#define OTA_CHECK_BODY_MAX     512
+// 与 notify.c 一致: HTTPS 握手 (mbedTLS + crt_bundle) 本身就要 ~10KB 栈,
+// 给足 14KB, 避免"点一下检查更新就重启"。
+#define OTA_CHECK_TASK_STACK   14336
+
+static ota_check_info_t s_check = {0};
+static volatile bool    s_check_running = false;
+
+void ota_check_get_info(ota_check_info_t *info)
+{
+    if (!info) return;
+    memcpy(info, &s_check, sizeof(*info));
+}
+
+// 从 JSON 中取字符串字段: {"version":"1.3.3"} -> 1.3.3
+static bool json_get_string(const char *json, const char *key, char *out, size_t out_len)
+{
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    k = strchr(k, ':');
+    if (!k) return false;
+    k++;
+    while (*k == ' ' || *k == '\t' || *k == '\n' || *k == '\r') k++;
+    if (*k != '"') return false;
+    k++;
+
+    size_t i = 0;
+    while (*k != '\0' && *k != '"' && i + 1 < out_len) {
+        out[i++] = *k++;
+    }
+    out[i] = '\0';
+    return (i > 0);
+}
+
+// 版本号比较: 逐段比较数字, a>b 返回 1, a==b 返回 0, a<b 返回 -1
+static int version_compare(const char *a, const char *b)
+{
+    unsigned va[3] = {0}, vb[3] = {0};
+    sscanf(a, "%u.%u.%u", &va[0], &va[1], &va[2]);
+    sscanf(b, "%u.%u.%u", &vb[0], &vb[1], &vb[2]);
+    for (int i = 0; i < 3; i++) {
+        if (va[i] != vb[i]) return (va[i] > vb[i]) ? 1 : -1;
+    }
+    return 0;
+}
+
+static void ota_check_task(void *pvParameter)
+{
+    char *body = calloc(1, OTA_CHECK_BODY_MAX + 1);
+    if (!body) {
+        s_check.state = OTA_CHECK_FAILED;
+        snprintf(s_check.message, sizeof(s_check.message), "内存不足, 请稍后重试");
+        s_check_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    esp_http_client_config_t cfg = {
+        .url = OTA_CHECK_URL,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = OTA_CHECK_TIMEOUT_MS,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .keep_alive_enable = false,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        free(body);
+        s_check.state = OTA_CHECK_FAILED;
+        snprintf(s_check.message, sizeof(s_check.message), "检查失败 (无法创建 HTTP 客户端)");
+        s_check_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    esp_http_client_set_header(client, "User-Agent", "ESP32C3-Watchdog/1.0");
+
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err == ESP_OK) {
+        esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+
+        int total = 0;
+        while (total < OTA_CHECK_BODY_MAX) {
+            int r = esp_http_client_read(client, body + total, OTA_CHECK_BODY_MAX - total);
+            if (r <= 0) break;
+            total += r;
+        }
+        body[total] = '\0';
+
+        if (status >= 200 && status < 300) {
+            char latest[32] = {0};
+            if (!json_get_string(body, "\"version\"", latest, sizeof(latest))) {
+                // 非 JSON: 把返回内容当纯文本版本号, 取第一个连续片段
+                const char *p = body;
+                while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+                size_t i = 0;
+                while (p[i] != '\0' && p[i] != ' ' && p[i] != '\n' &&
+                       p[i] != '\r' && p[i] != '\t' && i + 1 < sizeof(latest)) {
+                    latest[i] = p[i];
+                    i++;
+                }
+                latest[i] = '\0';
+            }
+
+            if (latest[0] == '\0') {
+                s_check.state = OTA_CHECK_FAILED;
+                snprintf(s_check.message, sizeof(s_check.message),
+                         "检查失败 (返回内容中没有版本号)");
+            } else {
+                const esp_app_desc_t *desc = esp_app_get_description();
+                const char *cur = (desc && desc->version[0]) ? desc->version : "unknown";
+
+                snprintf(s_check.latest_version, sizeof(s_check.latest_version), "%s", latest);
+                json_get_string(body, "\"url\"", s_check.url, sizeof(s_check.url));
+                s_check.has_update = (version_compare(latest, cur) > 0);
+                s_check.state = OTA_CHECK_OK;
+
+                if (s_check.has_update) {
+                    snprintf(s_check.message, sizeof(s_check.message),
+                             "发现新版本 %s (当前 %s)", latest, cur);
+                    ESP_LOGW(TAG, "New firmware available: %s (current %s)", latest, cur);
+                    LOG_W("检测到新固件版本 %s (当前 %s)", latest, cur);
+                } else {
+                    snprintf(s_check.message, sizeof(s_check.message),
+                             "已是最新版本 (当前 %s)", cur);
+                    ESP_LOGI(TAG, "Firmware up to date (%s)", cur);
+                    LOG_I("固件已是最新版本 (%s)", cur);
+                }
+            }
+        } else {
+            s_check.state = OTA_CHECK_FAILED;
+            snprintf(s_check.message, sizeof(s_check.message), "检查失败 (HTTP %d)", status);
+        }
+    } else {
+        s_check.state = OTA_CHECK_FAILED;
+        snprintf(s_check.message, sizeof(s_check.message), "检查失败 (无法连接服务器)");
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    free(body);
+
+    if (s_check.state == OTA_CHECK_FAILED) {
+        ESP_LOGW(TAG, "Online check failed: %s", s_check.message);
+    }
+
+    s_check_running = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t ota_check_start(void)
+{
+    if (OTA_CHECK_URL[0] == '\0') {
+        s_check.state = OTA_CHECK_FAILED;
+        snprintf(s_check.message, sizeof(s_check.message), "未配置在线检查地址");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_check_running) {
+        return ESP_ERR_INVALID_STATE;   // 上一次还在查, 忽略重复点击
+    }
+
+    s_check.state = OTA_CHECK_RUNNING;
+    s_check.has_update = false;
+    s_check.latest_version[0] = '\0';
+    s_check.url[0] = '\0';
+    snprintf(s_check.message, sizeof(s_check.message), "正在检查...");
+    s_check_running = true;
+
+    if (xTaskCreate(ota_check_task, "ota_check", OTA_CHECK_TASK_STACK, NULL, 4, NULL) != pdPASS) {
+        s_check_running = false;
+        s_check.state = OTA_CHECK_FAILED;
+        snprintf(s_check.message, sizeof(s_check.message), "内存不足, 请稍后重试");
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }

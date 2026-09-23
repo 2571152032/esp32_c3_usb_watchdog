@@ -351,6 +351,13 @@ void app_main(void)
     nvs_load_auto_poweroff(&auto_off);
     watchdog_set_auto_poweroff(auto_off);
 
+    // 加载"连续多少次重启未恢复就强制关机" (默认 WD_AUTO_POWEROFF_AFTER_REBOOTS, Web 端可改)
+    uint32_t auto_off_n = WD_AUTO_POWEROFF_AFTER_REBOOTS;
+    nvs_load_auto_poweroff_count(&auto_off_n);
+    watchdog_set_auto_poweroff_count(auto_off_n);
+    ESP_LOGI(TAG, "Auto poweroff: %s after %lu consecutive reboots",
+             auto_off ? "enabled" : "disabled", (unsigned long)auto_off_n);
+
     // 创建系统任务
     BaseType_t task_created = xTaskCreate(system_task, "system_task", 8192, NULL, 5, NULL);
     if (task_created != pdPASS) {

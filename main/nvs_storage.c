@@ -121,11 +121,13 @@ esp_err_t nvs_factory_reset(void)
     // 心跳参数 (回到 watchdog.c 中的默认值)
     nvs_erase_key(s_nvs_handle, NVS_KEY_HB_INTERVAL);
     nvs_erase_key(s_nvs_handle, NVS_KEY_HB_TIMEOUT);
-    // 自动保护开关 (回到默认 true)
+    // 自动保护开关 (回到默认 true) + 强制关机次数阈值 (回到默认 3 次)
     nvs_erase_key(s_nvs_handle, NVS_KEY_AUTO_OFF);
+    nvs_erase_key(s_nvs_handle, NVS_KEY_AUTO_OFF_N);
     // 通知设置 (回到默认 disabled + 空 URL)
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_EN);
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_URL);
+    nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_TOK);
 
     nvs_commit(s_nvs_handle);
 
@@ -133,6 +135,7 @@ esp_err_t nvs_factory_reset(void)
     nvs_restore_default_credentials();
 
     ESP_LOGW(TAG, "Factory reset done (WiFi + 心跳参数 + 自动保护 + 通知 + 凭据 已清空)");
+    // 注: srv_reboots (uptime.c) 与 log_* 计数由调用方按需单独清理
     return ESP_OK;
 }
 
@@ -203,7 +206,35 @@ esp_err_t nvs_load_auto_poweroff(bool *enabled)
     return ESP_OK;
 }
 
-esp_err_t nvs_save_notify_config(bool enabled, const char *url)
+esp_err_t nvs_save_auto_poweroff_count(uint32_t count)
+{
+    if (!s_initialized) return ESP_FAIL;
+
+    esp_err_t ret = nvs_set_u32(s_nvs_handle, NVS_KEY_AUTO_OFF_N, count);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save auto poweroff count: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "Auto poweroff count: %lu", (unsigned long)count);
+    return nvs_commit(s_nvs_handle);
+}
+
+esp_err_t nvs_load_auto_poweroff_count(uint32_t *count)
+{
+    if (!s_initialized) return ESP_FAIL;
+    if (!count) return ESP_ERR_INVALID_ARG;
+
+    uint32_t v = 0;
+    esp_err_t ret = nvs_get_u32(s_nvs_handle, NVS_KEY_AUTO_OFF_N, &v);
+    if (ret != ESP_OK) {
+        // 未保存过: 保持调用方填入的默认值
+        return ret;
+    }
+    *count = v;
+    return ESP_OK;
+}
+
+esp_err_t nvs_save_notify_config(bool enabled, const char *url, const char *token)
 {
     if (!s_initialized) return ESP_FAIL;
 
@@ -213,11 +244,15 @@ esp_err_t nvs_save_notify_config(bool enabled, const char *url)
     ret = nvs_set_str(s_nvs_handle, NVS_KEY_NOTIFY_URL, url ? url : "");
     if (ret != ESP_OK) return ret;
 
+    ret = nvs_set_str(s_nvs_handle, NVS_KEY_NOTIFY_TOK, token ? token : "");
+    if (ret != ESP_OK) return ret;
+
     ESP_LOGI(TAG, "Notify config saved: enabled=%d", (int)enabled);
     return nvs_commit(s_nvs_handle);
 }
 
-esp_err_t nvs_load_notify_config(bool *enabled, char *url, size_t url_len)
+esp_err_t nvs_load_notify_config(bool *enabled, char *url, size_t url_len,
+                                 char *token, size_t token_len)
 {
     if (!s_initialized) return ESP_FAIL;
 
@@ -229,6 +264,12 @@ esp_err_t nvs_load_notify_config(bool *enabled, char *url, size_t url_len)
         size_t len = url_len;
         if (nvs_get_str(s_nvs_handle, NVS_KEY_NOTIFY_URL, url, &len) != ESP_OK) {
             url[0] = '\0';
+        }
+    }
+    if (token && token_len > 0) {
+        size_t len = token_len;
+        if (nvs_get_str(s_nvs_handle, NVS_KEY_NOTIFY_TOK, token, &len) != ESP_OK) {
+            token[0] = '\0';
         }
     }
     return ESP_OK;

@@ -19,8 +19,10 @@ extern "C" {
 #define NVS_KEY_HB_INTERVAL "hb_interval"
 #define NVS_KEY_HB_TIMEOUT  "hb_timeout"
 #define NVS_KEY_AUTO_OFF    "auto_off"      // 连续多次重启后是否强制关机
+#define NVS_KEY_AUTO_OFF_N  "auto_off_n"    // 连续多少次重启未恢复后强制关机
 #define NVS_KEY_NOTIFY_EN   "ntfy_en"       // 通知推送开关
-#define NVS_KEY_NOTIFY_URL  "ntfy_url"      // 通知推送地址 (Webhook URL)
+#define NVS_KEY_NOTIFY_URL  "ntfy_url"      // 通知服务地址 (Base URL, 设备会自动追加 /n)
+#define NVS_KEY_NOTIFY_TOK  "ntfy_tok"      // 通知鉴权令牌 (Authorization: Bearer <token>)
 
 // 默认 Web 认证凭据 (重置网络后恢复为此默认值)
 #define DEFAULT_WEB_USERNAME  "admin"
@@ -89,14 +91,28 @@ esp_err_t nvs_save_auto_poweroff(bool enabled);
 esp_err_t nvs_load_auto_poweroff(bool *enabled);
 
 /**
- * @brief 保存通知推送配置
+ * @brief 保存"连续 N 次重启未恢复后强制关机"的次数阈值
  */
-esp_err_t nvs_save_notify_config(bool enabled, const char *url);
+esp_err_t nvs_save_auto_poweroff_count(uint32_t count);
 
 /**
- * @brief 加载通知推送配置 (未设置过时 enabled=false, url 为空串)
+ * @brief 加载该次数阈值 (未设置过时返回 ESP_ERR_NOT_FOUND, *count 保持调用前的值)
  */
-esp_err_t nvs_load_notify_config(bool *enabled, char *url, size_t url_len);
+esp_err_t nvs_load_auto_poweroff_count(uint32_t *count);
+
+/**
+ * @brief 保存通知推送配置
+ * @param enabled 是否启用
+ * @param url     通知服务地址 (Base URL), NULL 表示保持原值
+ * @param token   鉴权令牌 (Bearer), NULL 表示保持原值
+ */
+esp_err_t nvs_save_notify_config(bool enabled, const char *url, const char *token);
+
+/**
+ * @brief 加载通知推送配置 (未设置过时 enabled=false, url/token 为空串)
+ */
+esp_err_t nvs_load_notify_config(bool *enabled, char *url, size_t url_len,
+                                 char *token, size_t token_len);
 
 // ==================== Web 认证凭据 ====================
 

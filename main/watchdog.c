@@ -63,6 +63,7 @@ static struct {
 
     // === 自动保护 ===
     bool auto_poweroff_enabled;       // 连续多次重启后是否强制关机
+    uint32_t auto_poweroff_reboots;   // 连续多少次重启未恢复才算"多次" (Web 端可自定义)
     bool paused;                      // 因"主动软关机"暂停监控 (Web 点开机后自动恢复)
 } s_wd = {0};
 
@@ -202,31 +203,38 @@ static void watchdog_task(void *pvParameter)
                     s_wd.reboot_count_in_hour++;
                     s_wd.consecutive_reboots++;
 
-                    if (s_wd.reboot_count_in_hour > CONFIG_WD_MAX_REBOOTS_PER_HOUR) {
-                        ESP_LOGE(TAG, "MAX REBOOTS (%d/hour) REACHED - stopping watchdog",
-                                 CONFIG_WD_MAX_REBOOTS_PER_HOUR);
-                        LOG_F("看门狗已停止: 1 小时内重启次数过多 (%d 次), 需管理员介入",
-                              CONFIG_WD_MAX_REBOOTS_PER_HOUR);
-                        notify_send_async("看门狗已停止",
+                    // 每小时重启上限: 默认 CONFIG_WD_MAX_REBOOTS_PER_HOUR。
+                    // 但若用户把"连续 N 次强制关机"调得更高, 这个上限必须同步抬高 ——
+                    // 否则重启次数还没到 N 就被小时上限拦下, 自定义阈值永远触发不了。
+                    uint32_t hour_limit = (s_wd.auto_poweroff_reboots > (uint32_t)CONFIG_WD_MAX_REBOOTS_PER_HOUR)
+                                          ? s_wd.auto_poweroff_reboots
+                                          : (uint32_t)CONFIG_WD_MAX_REBOOTS_PER_HOUR;
+
+                    if (s_wd.reboot_count_in_hour > hour_limit) {
+                        ESP_LOGE(TAG, "MAX REBOOTS (%lu/hour) REACHED - stopping watchdog",
+                                 (unsigned long)hour_limit);
+                        LOG_F("看门狗已停止: 1 小时内重启次数过多 (%lu 次), 需管理员介入",
+                              (unsigned long)hour_limit);
+                        notify_send_event(NOTIFY_EVENT_WATCHDOG_STOPPED, "看门狗已停止",
                                           "1 小时内重启次数过多, 已停止自动重启, 需管理员介入");
                         gpio_set_led_state(LED_BLINK_FAST);  // 快闪 = 需管理员介入
                         s_wd.running = false;
                         break;
                     }
 
-                    // 连续多次重启后服务器仍未恢复 -> 触发强制关机 (可禁用), 并推送通知
+                    // 连续多次重启后服务器仍未恢复 -> 触发强制关机 (可禁用、次数可配置), 并推送通知
                     if (s_wd.auto_poweroff_enabled &&
-                        s_wd.consecutive_reboots >= WD_AUTO_POWEROFF_AFTER_REBOOTS) {
-                        ESP_LOGE(TAG, "Consecutive reboots reached %d - forcing server power off",
-                                 WD_AUTO_POWEROFF_AFTER_REBOOTS);
-                        LOG_F("连续 %d 次重启后服务器仍未恢复 -> 触发强制关机 (需管理员开机)",
-                              WD_AUTO_POWEROFF_AFTER_REBOOTS);
+                        s_wd.consecutive_reboots >= s_wd.auto_poweroff_reboots) {
+                        ESP_LOGE(TAG, "Consecutive reboots reached %lu - forcing server power off",
+                                 (unsigned long)s_wd.auto_poweroff_reboots);
+                        LOG_F("连续 %lu 次重启后服务器仍未恢复 -> 触发强制关机 (需管理员开机)",
+                              (unsigned long)s_wd.auto_poweroff_reboots);
 
                         char alert[160];
                         snprintf(alert, sizeof(alert),
-                                 "服务器连续 %d 次重启后仍未恢复, 看门狗已执行强制关机, 请管理员检查后重新开机",
-                                 WD_AUTO_POWEROFF_AFTER_REBOOTS);
-                        notify_send_async("强制关机通知", alert);
+                                 "服务器连续 %lu 次重启后仍未恢复, 看门狗已执行强制关机, 请管理员检查后重新开机",
+                                 (unsigned long)s_wd.auto_poweroff_reboots);
+                        notify_send_event(NOTIFY_EVENT_FORCE_POWEROFF, "强制关机通知", alert);
 
                         // 强制关机 = 长按电源键 5 秒
                         gpio_force_poweroff();
@@ -246,7 +254,7 @@ static void watchdog_task(void *pvParameter)
                         snprintf(alert, sizeof(alert),
                                  "心跳超时 %lu 秒无响应, 已触发服务器重启 (连续第 %lu 次)",
                                  (unsigned long)elapsed_s, (unsigned long)s_wd.consecutive_reboots);
-                        notify_send_async("宕机通知", alert);
+                        notify_send_event(NOTIFY_EVENT_SERVER_DOWN, "宕机通知", alert);
                     }
 
                     if (s_wd.server_down_callback) {
@@ -301,6 +309,7 @@ esp_err_t watchdog_init(void)
     s_wd.state = WD_STATE_IDLE;
     s_wd.window_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_wd.auto_poweroff_enabled = true;   // 默认开启, 由 NVS 配置覆盖
+    s_wd.auto_poweroff_reboots = WD_AUTO_POWEROFF_AFTER_REBOOTS;  // 默认次数, 由 NVS 配置覆盖
     return ESP_OK;
 }
 
@@ -478,13 +487,33 @@ void watchdog_register_server_down_callback(void (*cb)(void))
 void watchdog_set_auto_poweroff(bool enabled)
 {
     s_wd.auto_poweroff_enabled = enabled;
-    ESP_LOGI(TAG, "Auto poweroff after %d consecutive reboots: %s",
-             WD_AUTO_POWEROFF_AFTER_REBOOTS, enabled ? "enabled" : "disabled");
+    ESP_LOGI(TAG, "Auto poweroff after %lu consecutive reboots: %s",
+             (unsigned long)s_wd.auto_poweroff_reboots, enabled ? "enabled" : "disabled");
 }
 
 bool watchdog_get_auto_poweroff(void)
 {
     return s_wd.auto_poweroff_enabled;
+}
+
+void watchdog_set_auto_poweroff_count(uint32_t count)
+{
+    // 防御: watchdog_init() 之前被调用时阈值为 0, 这里兜底回默认值,
+    // 否则 "consecutive_reboots >= 0" 恒成立, 一宕机就立刻强制关机。
+    if (count == 0) {
+        count = WD_AUTO_POWEROFF_AFTER_REBOOTS;
+    }
+    if (count < WD_AUTO_POWEROFF_MIN_REBOOTS) count = WD_AUTO_POWEROFF_MIN_REBOOTS;
+    if (count > WD_AUTO_POWEROFF_MAX_REBOOTS) count = WD_AUTO_POWEROFF_MAX_REBOOTS;
+
+    s_wd.auto_poweroff_reboots = count;
+    ESP_LOGI(TAG, "Auto poweroff threshold: %lu consecutive reboots", (unsigned long)count);
+}
+
+uint32_t watchdog_get_auto_poweroff_count(void)
+{
+    return (s_wd.auto_poweroff_reboots == 0) ? (uint32_t)WD_AUTO_POWEROFF_AFTER_REBOOTS
+                                             : s_wd.auto_poweroff_reboots;
 }
 
 esp_err_t watchdog_resume(void)

@@ -133,6 +133,7 @@ static esp_err_t handler_settings(httpd_req_t *req);
 static esp_err_t handler_change_password(httpd_req_t *req);
 static esp_err_t handler_firmware(httpd_req_t *req);
 static esp_err_t handler_ota_status(httpd_req_t *req);
+static esp_err_t handler_ota_check(httpd_req_t *req);
 static esp_err_t handler_reset_wifi(httpd_req_t *req);
 static esp_err_t handler_favicon(httpd_req_t *req);
 
@@ -328,6 +329,7 @@ static esp_err_t handler_status(httpd_req_t *req)
         "\"watchdog_running\":%s,"
         "\"paused\":%s,"
         "\"poweroff_enabled\":%s,"
+        "\"poweroff_cnt\":%lu,"
         "\"notify_enabled\":%s,"
         "\"uptime_s\":%lu,"
         "\"reboots\":%lu,"
@@ -348,6 +350,7 @@ static esp_err_t handler_status(httpd_req_t *req)
         stats.running ? "true" : "false",
         stats.paused ? "true" : "false",
         stats.auto_poweroff_enabled ? "true" : "false",
+        (unsigned long)watchdog_get_auto_poweroff_count(),
         notify_is_enabled() ? "true" : "false",
         (unsigned long)uptime_get_seconds(),
         (unsigned long)uptime_get_reboots(),
@@ -614,8 +617,11 @@ static esp_err_t handler_settings(httpd_req_t *req)
 {
     if (!require_auth(req, true)) return ESP_OK;
 
-    // 查询串里可能同时带心跳参数、自动关机开关和通知地址(较长), 缓冲要够
-    char query[768];
+    // 查询串里可能同时带心跳参数、自动关机开关/次数和通知地址(较长), 缓冲要够。
+    // 通知地址最长 192 字符, URL 编码后最坏 3 倍 = 576; 令牌 96 -> 288;
+    // 再加上其他字段与分隔符, 768 会装不下 —— httpd_req_get_url_query_str 会直接
+    // 返回 ESP_ERR_HTTPD_RESULT_TRUNC, 表现为"长地址保存时提示缺少查询参数"。
+    char query[1280];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "application/json");
@@ -626,14 +632,18 @@ static esp_err_t handler_settings(httpd_req_t *req)
     char interval_str[16] = {0};
     char timeout_str[16]  = {0};
     char poweroff_str[8]  = {0};
+    char pcnt_str[8]      = {0};
     char notify_str[8]    = {0};
     char url_str[NOTIFY_URL_MAX_LEN * 3] = {0};
+    char token_str[NOTIFY_TOKEN_MAX_LEN * 3] = {0};
 
     bool has_interval = (httpd_query_key_value(query, "interval", interval_str, sizeof(interval_str)) == ESP_OK);
     bool has_timeout  = (httpd_query_key_value(query, "timeout",  timeout_str,  sizeof(timeout_str))  == ESP_OK);
     bool has_poweroff = (httpd_query_key_value(query, "poweroff", poweroff_str, sizeof(poweroff_str)) == ESP_OK);
+    bool has_pcnt     = (httpd_query_key_value(query, "poweroff_cnt", pcnt_str, sizeof(pcnt_str))     == ESP_OK);
     bool has_notify   = (httpd_query_key_value(query, "notify",   notify_str,   sizeof(notify_str))   == ESP_OK);
     bool has_url      = (httpd_query_key_value(query, "notify_url", url_str, sizeof(url_str)) == ESP_OK);
+    bool has_token    = (httpd_query_key_value(query, "notify_token", token_str, sizeof(token_str)) == ESP_OK);
 
     char msg[192] = "参数已保存";
 
@@ -663,10 +673,30 @@ static esp_err_t handler_settings(httpd_req_t *req)
         LOG_I("自动强制关机已%s", enabled ? "启用" : "禁用");
     }
 
-    if (has_notify || has_url) {
+    if (has_pcnt) {
+        uint32_t raw = (uint32_t)atoi(pcnt_str);
+        uint32_t cnt = raw;
+        // 钳制到合法区间, 防止 0 导致"一宕机就关机"、过大导致永不关机
+        if (cnt < WD_AUTO_POWEROFF_MIN_REBOOTS) cnt = WD_AUTO_POWEROFF_MIN_REBOOTS;
+        if (cnt > WD_AUTO_POWEROFF_MAX_REBOOTS) cnt = WD_AUTO_POWEROFF_MAX_REBOOTS;
+
+        watchdog_set_auto_poweroff_count(cnt);
+        nvs_save_auto_poweroff_count(cnt);
+        LOG_I("自动强制关机阈值已更新: 连续 %lu 次重启未恢复", (unsigned long)cnt);
+
+        // 与心跳参数一起提交时不重复报数, 只在被钳制时提示 (避免用户以为填多少就是多少)
+        if (cnt != raw) {
+            snprintf(msg, sizeof(msg), "参数已保存 (次数超出范围, 已调整为 %lu)", (unsigned long)cnt);
+        } else if (!(has_interval && has_timeout)) {
+            snprintf(msg, sizeof(msg), "参数已保存 (连续 %lu 次重启后强制关机)", (unsigned long)cnt);
+        }
+    }
+
+    if (has_notify || has_url || has_token) {
         bool enabled = has_notify ? (atoi(notify_str) != 0) : notify_is_enabled();
-        // 请求里没带 notify_url 时保持原地址, 避免因缺少参数把配置清空
-        const char *final_url = notify_get_url();
+        // 请求里没带 notify_url / notify_token 时保持原值, 避免缺参数把配置清空
+        const char *final_url   = notify_get_url();
+        const char *final_token = notify_get_token();
 
         if (has_url) {
             url_decode(url_str);
@@ -681,6 +711,11 @@ static esp_err_t handler_settings(httpd_req_t *req)
             final_url = url_str;
         }
 
+        if (has_token) {
+            url_decode(token_str);
+            final_token = token_str;
+        }
+
         // 启用了通知但地址为空 -> 视为无效, 直接拒绝, 避免"开了但发不出去"
         if (enabled && strlen(final_url) == 0) {
             httpd_resp_set_type(req, "application/json");
@@ -688,7 +723,7 @@ static esp_err_t handler_settings(httpd_req_t *req)
             return ESP_OK;
         }
 
-        notify_set_config(enabled, final_url);
+        notify_set_config(enabled, final_url, final_token);
         LOG_I("通知推送已%s", enabled ? "启用" : "禁用");
         snprintf(msg, sizeof(msg), "通知设置已保存 (%s)", enabled ? "启用" : "禁用");
     }
@@ -712,7 +747,7 @@ static esp_err_t handler_notify_test(httpd_req_t *req)
 
     char body[160];
     snprintf(body, sizeof(body), "这是一条来自 ESP32-C3 看门狗的测试通知");
-    notify_send_async("看门狗测试", body);
+    notify_send_event(NOTIFY_EVENT_TEST, "看门狗测试", body);
     LOG_I("已发送测试通知");
 
     httpd_resp_set_type(req, "application/json");
@@ -911,14 +946,22 @@ static esp_err_t handler_ota_status(httpd_req_t *req)
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
 
-    char json[512];
+    ota_check_info_t ci;
+    ota_check_get_info(&ci);
+
+    char json[1024];
     snprintf(json, sizeof(json),
         "{"
         "\"state\":\"%s\",\"state_code\":%d,"
         "\"progress\":%u,\"received\":%lu,\"total\":%lu,"
         "\"running_partition\":\"%s\","
         "\"next_partition\":\"%s\","
-        "\"reboot_pending\":%s"
+        "\"reboot_pending\":%s,"
+        "\"check_state\":%d,"
+        "\"has_update\":%s,"
+        "\"latest_version\":\"%s\","
+        "\"check_msg\":\"%s\","
+        "\"check_url\":\"%s\""
         "}",
         state_str, (int)st.state,
         (unsigned int)st.progress,
@@ -926,7 +969,12 @@ static esp_err_t handler_ota_status(httpd_req_t *req)
         (unsigned long)st.total_bytes,
         running ? running->label : "-",
         next ? next->label : "-",
-        ota_is_reboot_pending() ? "true" : "false"
+        ota_is_reboot_pending() ? "true" : "false",
+        (int)ci.state,
+        ci.has_update ? "true" : "false",
+        ci.latest_version,
+        ci.message,
+        ci.url
     );
 
     httpd_resp_set_type(req, "application/json");
@@ -934,12 +982,35 @@ static esp_err_t handler_ota_status(httpd_req_t *req)
     return ESP_OK;
 }
 
+// 触发一次"在线检查新固件" (异步: 内部起临时任务, 结果通过 /api/ota/status 轮询)
+static esp_err_t handler_ota_check(httpd_req_t *req)
+{
+    if (!require_auth(req, true)) return ESP_OK;
+
+    esp_err_t ret = ota_check_start();
+    char body[256];
+
+    if (ret == ESP_OK) {
+        snprintf(body, sizeof(body), "{\"status\":\"ok\",\"message\":\"正在检查更新...\"}");
+    } else {
+        ota_check_info_t ci;
+        ota_check_get_info(&ci);
+        const char *msg = ci.message[0] ? ci.message
+                        : (ret == ESP_ERR_INVALID_STATE ? "正在检查中或尚未配置地址" : "检查失败");
+        snprintf(body, sizeof(body), "{\"status\":\"error\",\"message\":\"%s\"}", msg);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, body, strlen(body));
+    return ESP_OK;
+}
+
 static esp_err_t handler_reset_wifi(httpd_req_t *req)
 {
     if (!require_auth(req, true)) return ESP_OK;
 
-    ESP_LOGI(TAG, "Web 请求恢复出厂设置 (WiFi + 心跳参数 + 自动保护 + 通知 + 凭据)");
-    LOG_W("Web 触发恢复出厂设置 (所有自定义参数已恢复默认)");
+    ESP_LOGI(TAG, "Web 请求恢复出厂设置");
+    LOG_W("Web 触发恢复出厂设置");
 
     // 恢复默认时同时清空事件日志, 避免旧日志继续堆积
     event_log_clear_ram();
@@ -1010,7 +1081,7 @@ static esp_err_t handler_dashboard(httpd_req_t *req)
             pulse = true;
             break;
         case WD_STATE_WARNING:
-            state_text = "警告 · 即将超时";
+            state_text = "警告 · 接近超时";   // 与前端 refreshAll() 中的文案保持一致
             led_color = "#f59e0b";
             break;
         case WD_STATE_SERVER_DOWN:
@@ -1034,9 +1105,11 @@ static esp_err_t handler_dashboard(httpd_req_t *req)
 
     const char *tpl = dashboard_get_html();
 
-    // 通知地址需要做 HTML 属性转义 (可能含 & " 等字符)
+    // 通知地址/令牌需要做 HTML 属性转义 (可能含 & " 等字符)
     char notify_url_esc[NOTIFY_URL_MAX_LEN * 6 + 8];
     html_escape_attr(notify_get_url(), notify_url_esc, sizeof(notify_url_esc));
+    char notify_token_esc[NOTIFY_TOKEN_MAX_LEN * 6 + 8];
+    html_escape_attr(notify_get_token(), notify_token_esc, sizeof(notify_token_esc));
 
     // 通知地址回填最长可达 6 倍 (全被转义), 预留足量空间, 避免占位符替换失败
     size_t cap = strlen(tpl) + strlen(notify_url_esc) + 1024;
@@ -1048,9 +1121,10 @@ static esp_err_t handler_dashboard(httpd_req_t *req)
     snprintf(html, cap, "%s", tpl);
 
     char v_interval[16], v_timeout[16];
-    char v_hb[16], v_resp[16], v_to[16], v_reboot[16], v_consec[16];
+    char v_hb[16], v_resp[16], v_to[16], v_reboot[16], v_consec[16], v_pcnt[16];
     snprintf(v_interval, sizeof(v_interval), "%lu", (unsigned long)hb_interval);
     snprintf(v_timeout,  sizeof(v_timeout),  "%lu", (unsigned long)hb_timeout);
+    snprintf(v_pcnt,     sizeof(v_pcnt),     "%lu", (unsigned long)watchdog_get_auto_poweroff_count());
     snprintf(v_hb,       sizeof(v_hb),       "%lu", (unsigned long)stats.heartbeat_count);
     snprintf(v_resp,     sizeof(v_resp),     "%lu", (unsigned long)stats.response_count);
     snprintf(v_to,       sizeof(v_to),       "%lu", (unsigned long)stats.timeout_count);
@@ -1073,8 +1147,10 @@ static esp_err_t handler_dashboard(httpd_req_t *req)
         { "{{REBOOT_COUNT}}",  v_reboot },
         { "{{CONSEC_REBOOTS}}", v_consec },
         { "{{POWEROFF_STATE}}", watchdog_get_auto_poweroff() ? "checked" : "" },
+        { "{{POWEROFF_CNT}}",   v_pcnt },
         { "{{NOTIFY_STATE}}",   notify_is_enabled() ? "checked" : "" },
         { "{{NOTIFY_URL}}",     notify_url_esc },
+        { "{{NOTIFY_TOKEN}}",   notify_token_esc },
     };
     for (size_t i = 0; i < sizeof(ph) / sizeof(ph[0]); i++) {
         ph_replace(html, cap, ph[i].key, ph[i].val);
@@ -1123,6 +1199,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/change_password",  .method = HTTP_POST, .handler = handler_change_password },
         { .uri = "/api/firmware",         .method = HTTP_POST, .handler = handler_firmware },
         { .uri = "/api/ota/status",       .method = HTTP_GET,  .handler = handler_ota_status },
+        { .uri = "/api/ota/check",        .method = HTTP_POST, .handler = handler_ota_check },
         { .uri = "/api/reset_wifi",       .method = HTTP_POST, .handler = handler_reset_wifi },
         { .uri = "/api/clear_logs",       .method = HTTP_POST, .handler = handler_clear_logs },
         { .uri = "/api/reset_stats",      .method = HTTP_POST, .handler = handler_reset_stats },
