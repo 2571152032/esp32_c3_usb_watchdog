@@ -20,6 +20,7 @@ extern "C" {
 #define NVS_KEY_HB_TIMEOUT  "hb_timeout"
 #define NVS_KEY_AUTO_OFF    "auto_off"      // 连续多次重启后是否强制关机
 #define NVS_KEY_AUTO_OFF_N  "auto_off_n"    // 连续多少次重启未恢复后强制关机
+#define NVS_KEY_USB_PAUSE   "usb_pause"     // 检测不到 USB 主机时是否暂停监控
 #define NVS_KEY_NOTIFY_EN   "ntfy_en"       // 通知推送开关
 #define NVS_KEY_NOTIFY_URL  "ntfy_url"      // 通知服务地址 (Base URL, 设备会自动追加 /n)
 #define NVS_KEY_NOTIFY_TOK  "ntfy_tok"      // 通知鉴权令牌 (Authorization: Bearer <token>)
@@ -102,6 +103,16 @@ esp_err_t nvs_save_auto_poweroff_count(uint32_t count);
  * @brief 加载该次数阈值 (未设置过时返回 ESP_ERR_NOT_FOUND, *count 保持调用前的值)
  */
 esp_err_t nvs_load_auto_poweroff_count(uint32_t *count);
+
+/**
+ * @brief 保存"检测不到 USB 主机时是否暂停监控"开关
+ */
+esp_err_t nvs_save_pause_on_usb_lost(bool enabled);
+
+/**
+ * @brief 加载该开关 (未设置过时默认为 false = 继续监控)
+ */
+esp_err_t nvs_load_pause_on_usb_lost(bool *enabled);
 
 /**
  * @brief 保存通知推送配置

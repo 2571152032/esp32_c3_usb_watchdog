@@ -363,6 +363,12 @@ void app_main(void)
     ESP_LOGI(TAG, "Auto poweroff: %s after %lu consecutive reboots",
              auto_off ? "enabled" : "disabled", (unsigned long)auto_off_n);
 
+    // 加载"检测不到 USB 主机时是否暂停监控" (默认 false = 继续监控)
+    bool usb_pause = false;
+    nvs_load_pause_on_usb_lost(&usb_pause);
+    watchdog_set_pause_on_usb_lost(usb_pause);
+    ESP_LOGI(TAG, "On USB lost: %s", usb_pause ? "pause monitoring" : "keep monitoring");
+
     // 创建系统任务
     BaseType_t task_created = xTaskCreate(system_task, "system_task", 8192, NULL, 5, NULL);
     if (task_created != pdPASS) {

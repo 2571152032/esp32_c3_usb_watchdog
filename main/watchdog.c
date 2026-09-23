@@ -64,6 +64,7 @@ static struct {
     // === 自动保护 ===
     bool auto_poweroff_enabled;       // 连续多次重启后是否强制关机
     uint32_t auto_poweroff_reboots;   // 连续多少次重启未恢复才算"多次" (Web 端可自定义)
+    bool pause_on_usb_lost;           // 检测不到 USB 主机时是否暂停监控 (默认 false = 继续监控)
     bool paused;                      // 因"主动软关机"暂停监控 (Web 点开机后自动恢复)
 } s_wd = {0};
 
@@ -145,6 +146,8 @@ static void usb_packet_handler(const usb_packet_t *packet)
 
 static void watchdog_task(void *pvParameter)
 {
+    bool usb_lost_reported = false;   // "USB 主机断开"只报一次, 避免刷屏
+
     ESP_LOGI(TAG, "Watchdog task started (interval=%lus, timeout=%lus)",
              s_wd.heartbeat_interval_s, s_wd.heartbeat_timeout_s);
     LOG_I("看门狗已启动: 心跳间隔 %lu 秒, 超时 %lu 秒",
@@ -160,13 +163,27 @@ static void watchdog_task(void *pvParameter)
 
         // 检查 USB 是否已连接 (真实判定: 还能收到主机 SOF 包)
         if (!usb_is_connected()) {
-            if (s_wd.state != WD_STATE_IDLE) {
-                ESP_LOGW(TAG, "USB host disconnected (no SOF), monitoring suspended");
-                LOG_W("USB 主机已断开, 暂停监控 (接回后自动恢复)");
-                s_wd.state = WD_STATE_IDLE;
+            if (!usb_lost_reported) {
+                usb_lost_reported = true;
+                ESP_LOGW(TAG, "USB host disconnected (no SOF)");
+                if (s_wd.pause_on_usb_lost) {
+                    LOG_W("USB 主机已断开, 按配置暂停监控 (接回后自动恢复)");
+                } else {
+                    LOG_W("USB 主机已断开, 按配置继续监控 (心跳超时仍会触发复位)");
+                }
             }
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
+            if (s_wd.pause_on_usb_lost) {
+                // 暂停: 不发心跳、不判宕机, 拔线维护时不会误复位服务器
+                s_wd.state = WD_STATE_IDLE;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            // 否则继续往下走: 照常发心跳、照常判超时并复位
+            // (不会漏掉"服务器死机到 USB 主机也停了"的场景)
+        } else if (usb_lost_reported) {
+            usb_lost_reported = false;
+            ESP_LOGI(TAG, "USB host reconnected");
+            LOG_I("USB 主机已重新连接, 恢复正常监控");
         }
 
         // 开机宽限期: 服务器刚重启, 暂不判定超时
@@ -329,6 +346,7 @@ esp_err_t watchdog_init(void)
     s_wd.window_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_wd.auto_poweroff_enabled = true;   // 默认开启, 由 NVS 配置覆盖
     s_wd.auto_poweroff_reboots = WD_AUTO_POWEROFF_AFTER_REBOOTS;  // 默认次数, 由 NVS 配置覆盖
+    s_wd.pause_on_usb_lost     = false;  // 默认继续监控 (与 1.3.2 及之前的行为一致)
     return ESP_OK;
 }
 
@@ -452,6 +470,7 @@ void watchdog_get_stats(watchdog_stats_t *stats)
     stats->consecutive_reboots  = s_wd.consecutive_reboots;
     stats->running              = s_wd.running;
     stats->auto_poweroff_enabled = s_wd.auto_poweroff_enabled;
+    stats->pause_on_usb_lost    = s_wd.pause_on_usb_lost;
     stats->paused               = s_wd.paused;
 }
 
@@ -561,6 +580,18 @@ uint32_t watchdog_get_auto_poweroff_count(void)
 {
     return (s_wd.auto_poweroff_reboots == 0) ? (uint32_t)WD_AUTO_POWEROFF_AFTER_REBOOTS
                                              : s_wd.auto_poweroff_reboots;
+}
+
+void watchdog_set_pause_on_usb_lost(bool enabled)
+{
+    s_wd.pause_on_usb_lost = enabled;
+    ESP_LOGI(TAG, "USB lost action: %s",
+             enabled ? "pause monitoring" : "keep monitoring (timeout still triggers reset)");
+}
+
+bool watchdog_get_pause_on_usb_lost(void)
+{
+    return s_wd.pause_on_usb_lost;
 }
 
 esp_err_t watchdog_resume(void)

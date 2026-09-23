@@ -330,6 +330,7 @@ static esp_err_t handler_status(httpd_req_t *req)
         "\"paused\":%s,"
         "\"poweroff_enabled\":%s,"
         "\"poweroff_cnt\":%lu,"
+        "\"pause_on_usb_lost\":%s,"
         "\"notify_enabled\":%s,"
         "\"uptime_s\":%lu,"
         "\"reboots\":%lu,"
@@ -351,6 +352,7 @@ static esp_err_t handler_status(httpd_req_t *req)
         stats.paused ? "true" : "false",
         stats.auto_poweroff_enabled ? "true" : "false",
         (unsigned long)watchdog_get_auto_poweroff_count(),
+        stats.pause_on_usb_lost ? "true" : "false",
         notify_is_enabled() ? "true" : "false",
         (unsigned long)uptime_get_seconds(),
         (unsigned long)uptime_get_reboots(),
@@ -633,6 +635,7 @@ static esp_err_t handler_settings(httpd_req_t *req)
     char timeout_str[16]  = {0};
     char poweroff_str[8]  = {0};
     char pcnt_str[8]      = {0};
+    char usbpause_str[8]  = {0};
     char notify_str[8]    = {0};
     char url_str[NOTIFY_URL_MAX_LEN * 3] = {0};
     char token_str[NOTIFY_TOKEN_MAX_LEN * 3] = {0};
@@ -641,6 +644,7 @@ static esp_err_t handler_settings(httpd_req_t *req)
     bool has_timeout  = (httpd_query_key_value(query, "timeout",  timeout_str,  sizeof(timeout_str))  == ESP_OK);
     bool has_poweroff = (httpd_query_key_value(query, "poweroff", poweroff_str, sizeof(poweroff_str)) == ESP_OK);
     bool has_pcnt     = (httpd_query_key_value(query, "poweroff_cnt", pcnt_str, sizeof(pcnt_str))     == ESP_OK);
+    bool has_usbpause = (httpd_query_key_value(query, "usb_pause", usbpause_str, sizeof(usbpause_str)) == ESP_OK);
     bool has_notify   = (httpd_query_key_value(query, "notify",   notify_str,   sizeof(notify_str))   == ESP_OK);
     bool has_url      = (httpd_query_key_value(query, "notify_url", url_str, sizeof(url_str)) == ESP_OK);
     bool has_token    = (httpd_query_key_value(query, "notify_token", token_str, sizeof(token_str)) == ESP_OK);
@@ -690,6 +694,13 @@ static esp_err_t handler_settings(httpd_req_t *req)
         } else if (!(has_interval && has_timeout)) {
             snprintf(msg, sizeof(msg), "参数已保存 (连续 %lu 次重启后强制关机)", (unsigned long)cnt);
         }
+    }
+
+    if (has_usbpause) {
+        bool enabled = (atoi(usbpause_str) != 0);
+        watchdog_set_pause_on_usb_lost(enabled);
+        nvs_save_pause_on_usb_lost(enabled);
+        LOG_I("USB 断开时处理: 已改为%s监控", enabled ? "暂停" : "继续");
     }
 
     if (has_notify || has_url || has_token) {
@@ -1156,6 +1167,7 @@ static esp_err_t handler_dashboard(httpd_req_t *req)
         { "{{CONSEC_REBOOTS}}", v_consec },
         { "{{POWEROFF_STATE}}", watchdog_get_auto_poweroff() ? "checked" : "" },
         { "{{POWEROFF_CNT}}",   v_pcnt },
+        { "{{USB_PAUSE_STATE}}", watchdog_get_pause_on_usb_lost() ? "checked" : "" },
         { "{{NOTIFY_STATE}}",   notify_is_enabled() ? "checked" : "" },
         { "{{NOTIFY_URL}}",     notify_url_esc },
         { "{{NOTIFY_TOKEN}}",   notify_token_esc },

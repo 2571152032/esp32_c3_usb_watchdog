@@ -124,6 +124,8 @@ esp_err_t nvs_factory_reset(void)
     // 自动保护开关 (回到默认 true) + 强制关机次数阈值 (回到默认 3 次)
     nvs_erase_key(s_nvs_handle, NVS_KEY_AUTO_OFF);
     nvs_erase_key(s_nvs_handle, NVS_KEY_AUTO_OFF_N);
+    // USB 断开处理开关 (回到默认: 继续监控)
+    nvs_erase_key(s_nvs_handle, NVS_KEY_USB_PAUSE);
     // 通知设置 (回到默认 disabled + 空 URL)
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_EN);
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_URL);
@@ -233,6 +235,34 @@ esp_err_t nvs_load_auto_poweroff_count(uint32_t *count)
         return ret;
     }
     *count = v;
+    return ESP_OK;
+}
+
+esp_err_t nvs_save_pause_on_usb_lost(bool enabled)
+{
+    if (!s_initialized) return ESP_FAIL;
+
+    esp_err_t ret = nvs_set_u8(s_nvs_handle, NVS_KEY_USB_PAUSE, enabled ? 1 : 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save usb pause flag: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "Pause on USB lost: %s", enabled ? "enabled" : "disabled");
+    return nvs_commit(s_nvs_handle);
+}
+
+esp_err_t nvs_load_pause_on_usb_lost(bool *enabled)
+{
+    if (!s_initialized) return ESP_FAIL;
+    if (!enabled) return ESP_ERR_INVALID_ARG;
+
+    uint8_t v = 0;   // 默认 false: 与历史行为一致 (USB 断开也继续监控)
+    esp_err_t ret = nvs_get_u8(s_nvs_handle, NVS_KEY_USB_PAUSE, &v);
+    if (ret != ESP_OK) {
+        *enabled = false;
+        return ESP_OK;
+    }
+    *enabled = (v == 1);
     return ESP_OK;
 }
 

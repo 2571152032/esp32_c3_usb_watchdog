@@ -65,6 +65,7 @@ typedef struct {
     bool     running;               // 监控任务是否在运行
     bool     auto_poweroff_enabled; // 连续多次重启后是否强制关机
     bool     paused;                // 因"主动软关机"暂停监控 (点开机即恢复)
+    bool     pause_on_usb_lost;     // 检测不到 USB 主机时是否暂停监控 (见 watchdog_set_pause_on_usb_lost)
 } watchdog_stats_t;
 
 /**
@@ -176,6 +177,29 @@ uint32_t watchdog_get_auto_poweroff_count(void);
  *        清零连续重启计数与退避, 并在任务已停止时重新拉起
  */
 esp_err_t watchdog_resume(void);
+
+/**
+ * @brief 设置 "检测不到 USB 主机时是否暂停监控"
+ *
+ * 两种行为各有取舍, 由用户按实际场景选择 (Web「看门狗参数」卡片可切换):
+ *
+ *  - true  (暂停): USB 断开(收不到主机 SOF)时只置 IDLE, 不发心跳也不判宕机。
+ *          好处: 拔掉 USB 线维护时不会周期性地误复位正常运行的服务器。
+ *          代价: 若服务器硬挂到连 USB 主机控制器都停了, 看门狗也不复位。
+ *
+ *  - false (继续监控, 默认): 不管 USB 是否断开都照常发心跳、照常判超时并复位。
+ *          好处: 不漏掉"死机死到 USB 一起失效"的场景。
+ *          代价: USB 线拔着的时候, 正常运行的服务器会被周期性复位。
+ *
+ * @note 仅影响"是否继续监控", 不影响 Web 上 USB 连接状态的显示 ——
+ *       那个始终是 usb_serial_jtag_is_connected() 的真实值。
+ */
+void watchdog_set_pause_on_usb_lost(bool enabled);
+
+/**
+ * @brief 查询 "USB 断开时是否暂停监控" (默认 false = 继续监控)
+ */
+bool watchdog_get_pause_on_usb_lost(void);
 
 #ifdef __cplusplus
 }
