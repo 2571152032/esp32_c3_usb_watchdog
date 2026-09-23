@@ -171,7 +171,15 @@ esp_err_t usb_device_deinit(void)
 
 bool usb_is_connected(void)
 {
-    return s_driver_installed;
+    if (!s_driver_installed) return false;
+
+    // 之前这里直接返回 "驱动是否已安装" —— 驱动一装上就恒为 true,
+    // 导致: 1) Web 永远显示 Connected; 2) watchdog.c 里 "USB 未连接 -> IDLE"
+    // 的分支永远进不去, 拔掉 USB 线后照样发心跳、照样判宕机并误复位服务器。
+    //
+    // usb_serial_jtag_is_connected(): 只要还在收到主机的 SOF 包就算"已连接",
+    // 即使串口没被打开也算; 而接充电宝/纯供电口不会被误判为连接 (没有 SOF)。
+    return usb_serial_jtag_is_connected();
 }
 
 esp_err_t usb_send_packet(const usb_packet_t *packet)

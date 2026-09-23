@@ -187,6 +187,11 @@ static void system_task(void *pvParameter)
     }
 
     while (1) {
+        // LED 在所有状态下都要刷新。
+        // 之前只在 RUNNING 的内循环里调用: WiFi 连不上 / 配网中时, 即使别的模块
+        // 调了 gpio_set_led_state(LED_BLINK_*), LED 也一直是灭的。
+        gpio_led_update();
+
         switch (g_system_state) {
             case SYS_STATE_BOOT: {
                 // 注: 长按按钮恢复出厂由 gpio_control 的按钮任务统一处理

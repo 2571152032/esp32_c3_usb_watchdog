@@ -40,7 +40,7 @@ esp_err_t uptime_init(void)
 
     nvs_ensure();
     if (s_nvs) {
-        nvs_get_u32(s_nvs, "srv_reboots", &s_up.total_reboots);
+        nvs_get_u32(s_nvs, NVS_KEY_SRV_REBOOTS, &s_up.total_reboots);
     }
 
     s_up.initialized = true;
@@ -83,7 +83,7 @@ void uptime_inc_reboots(void)
 
     nvs_ensure();
     if (s_nvs) {
-        nvs_set_u32(s_nvs, "srv_reboots", s_up.total_reboots);
+        nvs_set_u32(s_nvs, NVS_KEY_SRV_REBOOTS, s_up.total_reboots);
         nvs_commit(s_nvs);
     }
     ESP_LOGI(TAG, "Server reboot count -> %lu", (unsigned long)s_up.total_reboots);

@@ -128,6 +128,8 @@ esp_err_t nvs_factory_reset(void)
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_EN);
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_URL);
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_TOK);
+    // 累计服务器重启次数 (uptime.c): 恢复出厂后应从 0 开始
+    nvs_erase_key(s_nvs_handle, NVS_KEY_SRV_REBOOTS);
 
     nvs_commit(s_nvs_handle);
 

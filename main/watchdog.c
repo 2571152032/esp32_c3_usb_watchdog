@@ -113,6 +113,19 @@ static void watchdog_reset_state_internal(void)
     }
 }
 
+/**
+ * 内部: 只置"暂停"标记, 让看门狗任务在下一个检查点自行退出。
+ *
+ * 与 watchdog_pause() 的区别: 不等待、不 vTaskDelete —— 供 USB RX 回调这类
+ * 不应长时间阻塞的上下文调用 (收到 BYE 时就是在 RX 任务里)。
+ */
+static void watchdog_request_pause(void)
+{
+    s_wd.paused   = true;
+    s_wd.running  = false;
+    s_wd.state    = WD_STATE_IDLE;
+}
+
 // USB 回调: 收到响应
 static void usb_packet_handler(const usb_packet_t *packet)
 {
@@ -120,9 +133,13 @@ static void usb_packet_handler(const usb_packet_t *packet)
     if (packet->cmd == USB_CMD_ACK || packet->cmd == USB_CMD_PING) {
         watchdog_notify_response();
     } else if (packet->cmd == USB_CMD_BYE) {
-        ESP_LOGW(TAG, "Server sent BYE");
-        LOG_W("服务器发送了 BYE 信号");
-        s_wd.state = WD_STATE_SERVER_DOWN;
+        // BYE = 服务器主动关机 / 重启前通知 (守护进程退出前会发)。
+        // 之前这里只把状态标成 SERVER_DOWN, 监控照跑: 服务器关机后不再回心跳,
+        // 下一轮就被判宕机并 GPIO 复位 —— 刚关掉的机器又被按开机。
+        // 正确做法与"Web 软关机"一致: 暂停监控, 等管理员在 Web 点"开机"再恢复。
+        ESP_LOGW(TAG, "Server sent BYE (graceful shutdown), pausing watchdog");
+        LOG_W("服务器发送 BYE (主动关机), 已暂停监控; Web 端执行\"开机\"后自动恢复");
+        watchdog_request_pause();
     }
 }
 
@@ -141,9 +158,11 @@ static void watchdog_task(void *pvParameter)
     while (s_wd.running) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        // 检查 USB 是否已连接
+        // 检查 USB 是否已连接 (真实判定: 还能收到主机 SOF 包)
         if (!usb_is_connected()) {
             if (s_wd.state != WD_STATE_IDLE) {
+                ESP_LOGW(TAG, "USB host disconnected (no SOF), monitoring suspended");
+                LOG_W("USB 主机已断开, 暂停监控 (接回后自动恢复)");
                 s_wd.state = WD_STATE_IDLE;
             }
             vTaskDelay(pdMS_TO_TICKS(1000));
@@ -340,10 +359,33 @@ esp_err_t watchdog_start(uint32_t heartbeat_interval_ms, uint32_t timeout_ms)
     return ESP_OK;
 }
 
+/**
+ * 释放两路输出引脚 (复位 / 开机键)。
+ * 仅用于"任务被强制删除"前兜底: 若任务正卡在 gpio_force_poweroff() 长按电源键
+ * 或 gpio_trigger_server_reset() 的中间被删掉, GPIO 会停在有效电平 ——
+ * 表现为电源键或复位线被一直按住, 服务器再也起不来。
+ */
+static void gpio_release_outputs(void)
+{
+    gpio_set_level(CONFIG_RESET_GPIO_PIN,    !CONFIG_RESET_ACTIVE_LEVEL);
+    gpio_set_level(CONFIG_POWERON_GPIO_PIN,  !CONFIG_POWERON_ACTIVE_LEVEL);
+}
+
 void watchdog_stop(void)
 {
     s_wd.running = false;
+    s_wd.paused  = false;   // 主动停止 ≠ 软关机暂停: Web 端显示为红色告警
+
+    if (!s_wd.task_handle) return;
+
+    // 先给任务 3 秒自行退出 (心跳循环与退避等待循环都会检查 running),
+    // 实在退不出再强制删除 —— 直接 vTaskDelete 有把 GPIO 留在有效电平的风险。
+    for (int i = 0; i < 30 && s_wd.task_handle; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
     if (s_wd.task_handle) {
+        ESP_LOGW(TAG, "Watchdog task did not exit in time, force delete (GPIO released first)");
+        gpio_release_outputs();
         vTaskDelete(s_wd.task_handle);
         s_wd.task_handle = NULL;
     }
@@ -362,20 +404,16 @@ void watchdog_stop(void)
  */
 void watchdog_pause(void)
 {
-    if (!s_wd.running) {
-        s_wd.paused = true;
-        return;
-    }
+    // 置标记让任务自行退出; 任务已停时这里等价于"仅标记"
+    watchdog_request_pause();
 
-    s_wd.paused = true;
-    s_wd.running = false;   // 任务在下一个检查点自行退出 (心跳/退避循环均会检查)
-    s_wd.state = WD_STATE_IDLE;
-
-    // 等任务自行退出, 避免 vTaskDelete 与任务末尾自删除竞争
+    // 等任务在下一个检查点自行退出, 避免 vTaskDelete 与任务末尾自删除竞争
     for (int i = 0; i < 25 && s_wd.task_handle; i++) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     if (s_wd.task_handle) {
+        // 兜底: 同样先把 GPIO 拉回无效电平, 再强制删除
+        gpio_release_outputs();
         vTaskDelete(s_wd.task_handle);
         s_wd.task_handle = NULL;
     }
@@ -429,8 +467,17 @@ void watchdog_reset_stats(void)
     s_wd.consecutive_timeouts = 0;
     s_wd.last_heartbeat_ms    = now_ms;
     s_wd.last_response_ms     = now_ms;
+
+    // 自动保护计数也一并清零: Web 端"清零"按钮所在的心跳统计卡片里就显示着
+    // "连续重启 (自动保护计数)", 点了却不清会让人以为按钮坏了。
+    // (如不希望清零保护计数, 把下面三行去掉即可)
+    s_wd.consecutive_reboots  = 0;
+    s_wd.reboot_count_in_hour = 0;
+    s_wd.window_start_ms      = now_ms;
+    s_wd.stable_since_ms      = 0;
+
     ESP_LOGI(TAG, "Watchdog stats reset");
-    LOG_I("心跳统计已清零");
+    LOG_I("心跳统计与自动保护计数已清零");
 }
 
 void watchdog_notify_response(void)

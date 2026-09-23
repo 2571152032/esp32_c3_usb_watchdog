@@ -24,6 +24,9 @@ extern "C" {
 #define NVS_KEY_NOTIFY_URL  "ntfy_url"      // 通知服务地址 (Base URL, 设备会自动追加 /n)
 #define NVS_KEY_NOTIFY_TOK  "ntfy_tok"      // 通知鉴权令牌 (Authorization: Bearer <token>)
 
+// 服务器累计重启次数 (由 uptime.c 维护; 恢复出厂时一并清除)
+#define NVS_KEY_SRV_REBOOTS "srv_reboots"
+
 // 默认 Web 认证凭据 (重置网络后恢复为此默认值)
 #define DEFAULT_WEB_USERNAME  "admin"
 #define DEFAULT_WEB_PASSWORD  "admin123"

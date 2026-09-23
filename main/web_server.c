@@ -788,7 +788,15 @@ static esp_err_t handler_change_password(httpd_req_t *req)
 
         char real_pass[MAX_PASS_LEN] = {0};
         char real_user[MAX_USER_LEN] = {0};
-        nvs_get_credentials(real_user, sizeof(real_user), real_pass, sizeof(real_pass));
+        // 必须检查返回值: NVS 读取失败时 real_user/real_pass 会是空串,
+        // 下面 strcmp(old_pass, real_pass) 必然不等, 表现为"当前密码一直错误",
+        // 用户永远改不了密码且看不出原因。
+        if (nvs_get_credentials(real_user, sizeof(real_user),
+                                real_pass, sizeof(real_pass)) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read stored credentials");
+            httpd_resp_send_500(req);
+            return ESP_OK;
+        }
 
         if (strlen(old_pass) > 0 && strcmp(old_pass, real_pass) != 0) {
             httpd_resp_set_type(req, "application/json");
