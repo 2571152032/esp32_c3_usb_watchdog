@@ -23,6 +23,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 
 #include "watchdog.h"
 #include "usb_device.h"
@@ -65,6 +66,7 @@ static struct {
     bool auto_poweroff_enabled;       // 连续多次重启后是否强制关机
     uint32_t auto_poweroff_reboots;   // 连续多少次重启未恢复才算"多次" (Web 端可自定义)
     bool pause_on_usb_lost;           // 检测不到 USB 主机时是否暂停监控 (默认 false = 继续监控)
+    bool reboot_on_usb_lost;          // USB 串口断开时是否软重启看门狗设备 (默认 false)
     bool paused;                      // 因"主动软关机"暂停监控 (Web 点开机后自动恢复)
 } s_wd = {0};
 
@@ -170,6 +172,11 @@ static void watchdog_task(void *pvParameter)
                     LOG_W("USB 主机已断开, 按配置暂停监控 (接回后自动恢复)");
                 } else {
                     LOG_W("USB 主机已断开, 按配置继续监控 (心跳超时仍会触发复位)");
+                }
+                if (s_wd.reboot_on_usb_lost) {
+                    LOG_W("USB 主机断开, 按配置软重启看门狗设备");
+                    vTaskDelay(pdMS_TO_TICKS(800));
+                    esp_restart();
                 }
             }
             if (s_wd.pause_on_usb_lost) {
@@ -347,6 +354,7 @@ esp_err_t watchdog_init(void)
     s_wd.auto_poweroff_enabled = true;   // 默认开启, 由 NVS 配置覆盖
     s_wd.auto_poweroff_reboots = WD_AUTO_POWEROFF_AFTER_REBOOTS;  // 默认次数, 由 NVS 配置覆盖
     s_wd.pause_on_usb_lost     = false;  // 默认继续监控 (与 1.3.2 及之前的行为一致)
+    s_wd.reboot_on_usb_lost    = false;  // 默认不重启
     return ESP_OK;
 }
 
@@ -591,6 +599,18 @@ void watchdog_set_pause_on_usb_lost(bool enabled)
 bool watchdog_get_pause_on_usb_lost(void)
 {
     return s_wd.pause_on_usb_lost;
+}
+
+void watchdog_set_reboot_on_usb_lost(bool enabled)
+{
+    s_wd.reboot_on_usb_lost = enabled;
+    ESP_LOGI(TAG, "USB lost action: %s",
+             enabled ? "reboot watchdog device" : "no reboot");
+}
+
+bool watchdog_get_reboot_on_usb_lost(void)
+{
+    return s_wd.reboot_on_usb_lost;
 }
 
 esp_err_t watchdog_resume(void)

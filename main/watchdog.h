@@ -201,6 +201,22 @@ void watchdog_set_pause_on_usb_lost(bool enabled);
  */
 bool watchdog_get_pause_on_usb_lost(void);
 
+/**
+ * @brief 设置 "USB 串口断开时是否软重启看门狗设备本身"
+ *
+ * 默认 false (不重启)。开启后一旦检测到 USB 主机断开 (收不到 SOF 包),
+ * 看门狗设备立即软重启 (esp_restart), 与网页「设备重启」行为相同。
+ *
+ * @note 若 USB 长期保持断开, 设备会反复重启 (每次启动都会再次检测到断开);
+ *       适用于"USB 断开即代表需要复位看门狗"的部署场景。
+ */
+void watchdog_set_reboot_on_usb_lost(bool enabled);
+
+/**
+ * @brief 查询 "USB 串口断开时是否软重启看门狗设备" (默认 false = 不重启)
+ */
+bool watchdog_get_reboot_on_usb_lost(void);
+
 #ifdef __cplusplus
 }
 #endif

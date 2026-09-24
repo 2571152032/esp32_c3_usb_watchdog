@@ -126,6 +126,8 @@ esp_err_t nvs_factory_reset(void)
     nvs_erase_key(s_nvs_handle, NVS_KEY_AUTO_OFF_N);
     // USB 断开处理开关 (回到默认: 继续监控)
     nvs_erase_key(s_nvs_handle, NVS_KEY_USB_PAUSE);
+    // USB 断开触发重启开关 (回到默认: 不重启)
+    nvs_erase_key(s_nvs_handle, NVS_KEY_USB_REBOOT);
     // 通知设置 (回到默认 disabled + 空 URL)
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_EN);
     nvs_erase_key(s_nvs_handle, NVS_KEY_NOTIFY_URL);
@@ -290,6 +292,34 @@ esp_err_t nvs_load_web_notify(bool *enabled)
     esp_err_t ret = nvs_get_u8(s_nvs_handle, NVS_KEY_WEB_NOTIFY, &v);
     if (ret != ESP_OK) {
         *enabled = true;   // 未保存过 -> 默认开启
+        return ESP_OK;
+    }
+    *enabled = (v == 1);
+    return ESP_OK;
+}
+
+esp_err_t nvs_save_usb_reboot_on_disconnect(bool enabled)
+{
+    if (!s_initialized) return ESP_FAIL;
+
+    esp_err_t ret = nvs_set_u8(s_nvs_handle, NVS_KEY_USB_REBOOT, enabled ? 1 : 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save usb reboot flag: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "USB reboot on lost: %s", enabled ? "enabled" : "disabled");
+    return nvs_commit(s_nvs_handle);
+}
+
+esp_err_t nvs_load_usb_reboot_on_disconnect(bool *enabled)
+{
+    if (!s_initialized) return ESP_FAIL;
+    if (!enabled) return ESP_ERR_INVALID_ARG;
+
+    uint8_t v = 0;   // 默认 false: 与历史行为一致 (断开不重启)
+    esp_err_t ret = nvs_get_u8(s_nvs_handle, NVS_KEY_USB_REBOOT, &v);
+    if (ret != ESP_OK) {
+        *enabled = false;
         return ESP_OK;
     }
     *enabled = (v == 1);

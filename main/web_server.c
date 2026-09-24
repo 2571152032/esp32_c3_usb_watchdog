@@ -29,6 +29,8 @@ static httpd_handle_t s_server = NULL;
 
 // 网页触发的电源操作 (开机/关机/重启/强制关机/设备重启) 是否发送通知
 static bool s_web_notify = true;
+// USB 串口断开时是否软重启看门狗设备 (默认关闭)
+static bool s_usb_reboot = false;
 
 // ==================== 会话管理 (简易 cookie session) ====================
 
@@ -655,6 +657,7 @@ static esp_err_t handler_settings(httpd_req_t *req)
     char pcnt_str[8]      = {0};
     char usbpause_str[8]  = {0};
     char webnotify_str[8] = {0};
+    char usbreboot_str[8] = {0};
     char notify_str[8]    = {0};
     char url_str[NOTIFY_URL_MAX_LEN * 3] = {0};
     char token_str[NOTIFY_TOKEN_MAX_LEN * 3] = {0};
@@ -665,6 +668,7 @@ static esp_err_t handler_settings(httpd_req_t *req)
     bool has_pcnt     = (httpd_query_key_value(query, "poweroff_cnt", pcnt_str, sizeof(pcnt_str))     == ESP_OK);
     bool has_usbpause = (httpd_query_key_value(query, "usb_pause", usbpause_str, sizeof(usbpause_str)) == ESP_OK);
     bool has_webnotify = (httpd_query_key_value(query, "web_notify", webnotify_str, sizeof(webnotify_str)) == ESP_OK);
+    bool has_usbreboot = (httpd_query_key_value(query, "usb_reboot", usbreboot_str, sizeof(usbreboot_str)) == ESP_OK);
     bool has_notify   = (httpd_query_key_value(query, "notify",   notify_str,   sizeof(notify_str))   == ESP_OK);
     bool has_url      = (httpd_query_key_value(query, "notify_url", url_str, sizeof(url_str)) == ESP_OK);
     bool has_token    = (httpd_query_key_value(query, "notify_token", token_str, sizeof(token_str)) == ESP_OK);
@@ -727,6 +731,13 @@ static esp_err_t handler_settings(httpd_req_t *req)
         s_web_notify = (atoi(webnotify_str) != 0);
         nvs_save_web_notify(s_web_notify);
         LOG_I("网页操作通知已%s", s_web_notify ? "启用" : "禁用");
+    }
+
+    if (has_usbreboot) {
+        s_usb_reboot = (atoi(usbreboot_str) != 0);
+        watchdog_set_reboot_on_usb_lost(s_usb_reboot);
+        nvs_save_usb_reboot_on_disconnect(s_usb_reboot);
+        LOG_I("USB 断开触发重启已%s", s_usb_reboot ? "启用" : "禁用");
     }
 
     if (has_notify || has_url || has_token) {
@@ -1198,6 +1209,7 @@ static esp_err_t handler_dashboard(httpd_req_t *req)
         { "{{NOTIFY_URL}}",     notify_url_esc },
         { "{{NOTIFY_TOKEN}}",   notify_token_esc },
         { "{{WEB_NOTIFY_STATE}}", s_web_notify ? "checked" : "" },
+        { "{{USB_REBOOT_STATE}}", s_usb_reboot ? "checked" : "" },
     };
     for (size_t i = 0; i < sizeof(ph) / sizeof(ph[0]); i++) {
         ph_replace(html, cap, ph[i].key, ph[i].val);
@@ -1221,6 +1233,7 @@ esp_err_t web_server_start(void)
     config.lru_purge_enable = true;
 
     nvs_load_web_notify(&s_web_notify);   // 网页操作通知开关 (默认开启)
+    nvs_load_usb_reboot_on_disconnect(&s_usb_reboot);   // USB 断开触发重启开关 (默认关闭)
 
     esp_err_t ret = httpd_start(&s_server, &config);
     if (ret != ESP_OK) {

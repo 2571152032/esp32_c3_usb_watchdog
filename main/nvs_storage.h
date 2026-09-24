@@ -21,6 +21,7 @@ extern "C" {
 #define NVS_KEY_AUTO_OFF    "auto_off"      // 连续多次重启后是否强制关机
 #define NVS_KEY_AUTO_OFF_N  "auto_off_n"    // 连续多少次重启未恢复后强制关机
 #define NVS_KEY_USB_PAUSE   "usb_pause"     // 检测不到 USB 主机时是否暂停监控
+#define NVS_KEY_USB_REBOOT  "usb_reboot"    // USB 串口断开时是否软重启看门狗设备
 #define NVS_KEY_NOTIFY_EN   "ntfy_en"       // 通知推送开关
 #define NVS_KEY_NOTIFY_URL  "ntfy_url"      // 通知服务地址 (Base URL, 设备会自动追加 /n)
 #define NVS_KEY_NOTIFY_TOK  "ntfy_tok"      // 通知鉴权令牌 (Authorization: Bearer <token>)
@@ -138,6 +139,9 @@ esp_err_t nvs_save_web_notify(bool enabled);
  * @brief 加载该开关 (未设置过时默认为 true: 网页操作也发通知)
  */
 esp_err_t nvs_load_web_notify(bool *enabled);
+
+esp_err_t nvs_save_usb_reboot_on_disconnect(bool enabled);
+esp_err_t nvs_load_usb_reboot_on_disconnect(bool *enabled);
 
 // ==================== Web 认证凭据 ====================
 
