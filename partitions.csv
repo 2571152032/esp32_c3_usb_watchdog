@@ -1,0 +1,11 @@
+# ESP32-C3 分区表 (4MB Flash / OTA 双分区)  —— 本项目默认配置
+#
+# 适用: menuconfig -> Serial Flasher Config -> Flash size = 4MB
+#       (sdkconfig.defaults 中已设 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y)
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x5000,
+phy_init,   data, phy,     0xe000,   0x1000,
+otadata,    data, ota,     0xf000,   0x2000,
+ota_0,      app,  ota_0,   0x20000,  0x1F0000,
+ota_1,      app,  ota_1,   0x210000, 0x1F0000,
